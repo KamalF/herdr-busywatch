@@ -1,0 +1,25 @@
+[Unit]
+Description=Mark herdr workspaces, tabs and panes that are busy, waiting, or finished unseen
+
+[Service]
+# A supervised alternative to the plugin's startup hook. Use one or the other,
+# not both.
+#
+# This is a USER unit: install it at ~/.config/systemd/user/busywatch.service
+# and enable it with `systemctl --user enable --now busywatch`. Installed
+# system-wide instead, %h expands to /root, every socket call gets ENOENT, and
+# the poller spins silently forever without ever failing for Restart to catch.
+#
+# ExecStart runs the poller through the link that the plugin's start script
+# refreshes on every run. Edit it in two cases: XDG_STATE_HOME set to somewhere
+# other than ~/.local/state (systemd will not expand it), or the plugin
+# disabled and then moved by an upgrade, which leaves the link dangling with
+# nothing to refresh it. `herdr plugin list --json` reports the new root.
+ExecStart=/usr/bin/python3 %h/.local/state/busywatch/busywatch
+# Only for a non-default socket.
+# Environment=HERDR_SOCKET_PATH=%h/.config/herdr/herdr.sock
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

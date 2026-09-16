@@ -1,0 +1,22 @@
+id = "busywatch"
+name = "busywatch"
+version = "0.1.0"
+min_herdr_version = "0.9.0"
+description = "Mark workspaces, tabs and panes that are running, waiting on you, or finished unseen"
+platforms = ["linux", "macos"]
+
+# Spawns the poller detached and exits; a second run leaves a running one alone.
+[[startup]]
+command = ["bin/busywatch-start"]
+
+[[actions]]
+id = "restart"
+title = "Restart busywatch"
+contexts = ["workspace"]
+command = ["bin/busywatch-start", "--restart"]
+
+[[actions]]
+id = "stop"
+title = "Stop busywatch"
+contexts = ["workspace"]
+command = ["bin/busywatch-start", "--stop"]

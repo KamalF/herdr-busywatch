@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""Start, restart, or stop the busywatch poller.
+
+Herdr runs `[[startup]]` hooks as one-shot commands, not supervised daemons, so
+this spawns the poller detached and exits. It is idempotent: if the pidfile
+names a live poller, it leaves it alone, which is what makes it safe to run on
+every server start and live handoff.
+
+Outside herdr this is also the plain way to run it by hand; see the systemd unit
+for a supervised alternative.
+"""
+import os
+import signal
+import subprocess
+import sys
+
+ROOT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+
+# Deliberately not HERDR_PLUGIN_STATE_DIR, which herdr injects into plugin
+# commands but not into panes: the pidfile has to be the same one whether the
+# startup hook wrote it or you ran this by hand from a shell, or --stop would
+# quietly fail to find the running poller.
+STATE = os.path.join(os.environ.get("XDG_STATE_HOME")
+                     or os.path.expanduser("~/.local/state"), "busywatch")
+PIDFILE = os.path.join(STATE, "busywatch.pid")
+POLLER = os.path.join(ROOT, "bin", "busywatch")
+
+# The plugin root is somewhere you have to ask herdr for, so the files the
+# README tells you to source or copy — the shell hooks and the systemd unit —
+# are linked into the state directory under a fixed path. The poller is linked
+# too, for the unit's ExecStart. Every run refreshes the links, so they follow
+# the plugin root if an upgrade moves it.
+LINKED = ("shell/busywatch.bash", "shell/busywatch.zsh", "shell/busywatch.fish",
+          "systemd/busywatch.service", os.path.relpath(POLLER, ROOT))
+
+
+def link_files():
+    """Never fatal: the links are a convenience."""
+    for rel in LINKED:
+        link = os.path.join(STATE, os.path.basename(rel))
+        pending = f"{link}.{os.getpid()}"
+        try:
+            os.symlink(os.path.join(ROOT, rel), pending)
+            # Replace rather than unlink-then-link: herdr restores panes while
+            # this runs, and a shell sourcing the hook at that moment gets the
+            # old link or the new one, never nothing.
+            os.replace(pending, link)
+        except OSError as exc:
+            print(f"could not link {link}: {exc}", file=sys.stderr)
+
+
+def is_poller(pid):
+    """Does this pid really belong to our poller?
+
+    The pidfile outlives a reboot and pids are reused, so a live pid proves
+    nothing: without this, `--stop` SIGTERMs whatever now owns that number and
+    a plain start reports a poller that was never started. If neither /proc nor
+    ps can say, fall back to trusting the pidfile as before.
+    """
+    # Exact, not a substring: the poller is spawned as [python, POLLER], so
+    # argv[1] is the path itself. A pager or an editor opened on that same file
+    # would pass a substring test and be mistaken for the poller.
+    target = os.fsencode(POLLER)
+    try:
+        # Binary: another process's argv need not be valid UTF-8.
+        with open(f"/proc/{pid}/cmdline", "rb") as fh:
+            argv = fh.read().split(b"\0")
+        return len(argv) > 1 and os.path.realpath(argv[1]) == target
+    except OSError:
+        pass
+    try:
+        out = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             timeout=5, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return True
+    # `ps` gives one string, so argv cannot be recovered from it exactly.
+    # Accept either reading, because a space can fall on either side: the
+    # poller's own path (so don't split into fields) or the interpreter's (so
+    # don't assume the first space ends it). A pager's `tail -f <poller>`
+    # matches neither, because `-f` is left over and a flag is not a file.
+    line = out.stdout.strip()
+    interpreter, _, rest = line.partition(b" ")
+    if interpreter and os.path.realpath(rest) == target:
+        return True
+    if line.endswith(target):
+        head = line[: -len(target)].rstrip()
+        return bool(head) and os.path.exists(head)
+    return False
+
+
+def running():
+    """The pid of a live poller from the pidfile, or None."""
+    try:
+        with open(PIDFILE) as fh:
+            pid = int(fh.read().strip())
+        # Reject 0 and negatives before they reach os.kill, where they mean
+        # "the whole process group" and "every process we may signal".
+        if pid <= 1:
+            return None
+        os.kill(pid, 0)  # signal 0 only checks that we may signal it
+    except (OSError, ValueError):
+        return None
+    return pid if is_poller(pid) else None
+
+
+def stop():
+    pid = running()
+    if pid is None:
+        return False
+    os.kill(pid, signal.SIGTERM)  # the poller withdraws its marks on SIGTERM
+    try:
+        os.remove(PIDFILE)
+    except OSError:
+        pass
+    return True
+
+
+def start():
+    log = open(os.path.join(STATE, "busywatch.log"), "a")
+    child = subprocess.Popen(
+        [sys.executable, POLLER],
+        stdout=log, stderr=log, stdin=subprocess.DEVNULL,
+        start_new_session=True,  # survive the hook exiting
+    )
+    with open(PIDFILE, "w") as fh:
+        fh.write(str(child.pid))
+    return child.pid
+
+
+def main():
+    arg = sys.argv[1] if len(sys.argv) > 1 else ""
+    if arg not in ("", "--stop", "--restart"):
+        print(f"usage: {os.path.basename(sys.argv[0])} [--restart|--stop]",
+              file=sys.stderr)
+        return 2
+    # Before the poller check, not inside start(): a poller that is already
+    # running is the common case on every server start, and an upgrade that
+    # moved the plugin has to re-point the links whether or not one is.
+    os.makedirs(STATE, exist_ok=True)
+    link_files()
+    if arg == "--stop":
+        print("stopped" if stop() else "not running")
+        return 0
+    if arg == "--restart":
+        stop()
+    else:
+        pid = running()
+        if pid:
+            print(f"already running (pid {pid})")
+            return 0
+    print(f"started (pid {start()})")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

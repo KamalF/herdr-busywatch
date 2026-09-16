@@ -1,0 +1,780 @@
+#!/usr/bin/env python3
+"""Show what is running, what is waiting on you, and what finished unseen.
+
+Four surfaces, each answering a different question:
+
+  spaces panel   which workspace has something going on
+  tab bar        which tab inside it, without opening anything
+  pane label     which pane, and for how long
+  agent row      which Claude agent looks idle but still has work in flight
+
+Every mark but one carries a TTL, so a poller that dies takes them with it a
+few seconds later and there is no state to clean up. The exception is the tab
+name, which has no metadata API to hang a TTL on; see TAB_GLYPHS.
+"""
+import glob
+import json
+import os
+import signal
+import socket
+import stat
+import sys
+import time
+import traceback
+
+POLL_SECONDS = 2.0
+MIN_BUSY_SECONDS = 10  # below this a command is not worth showing
+TOKEN_TTL_MS = 8000  # ~4 ticks: marks outlive a slow tick, not a dead poller
+FULL_SWEEP_TICKS = 5  # poll every pane this often, whatever its revision says
+LABEL_MAX = 40  # a name longer than this is noise on every surface
+SOURCE = "busywatch"
+WORKSPACE_TOKENS = ("run", "wait", "done")
+
+# A sentinel distinct from None: "herdr did not answer for this pane" is not
+# the same as "this pane is idle", and treating the first as the second reports
+# a running command as finished.
+UNKNOWN = object()
+
+# Foreground programs that mean "a human is sitting in a TUI", not "work is
+# running". Without this every editor and file manager shows as busy.
+IGNORE = {
+    "fish", "bash", "zsh", "sh", "dash",
+    "hx", "vim", "nvim", "emacs", "nano", "kak",
+    "yazi", "ranger", "lf", "nnn",
+    "btop", "htop", "top", "k9s", "lazygit", "gitui", "tuicr",
+    "less", "more", "man", "bat", "jless", "visidata",
+    "mpv", "claude", "herdr", "ssh",
+}
+
+# Interpreters that say nothing about the task, so the script they were given is
+# the better label: `node …/bin/cloudcli -p 8888` reads as "cloudcli".
+GENERIC = {"node", "python", "python3", "ruby", "perl", "java", "uv", "npx", "env", "sh"}
+
+# A generic interpreter's own subcommand says as little as the interpreter does.
+SUBCOMMANDS = {"run", "exec", "tool"}
+
+# Claude writes one .output file per background task, named "b…" for a
+# backgrounded Bash command and "a…" for a background subagent. Nothing fires
+# when either finishes, so the file itself has to say so: a Bash task ends with
+# a marker, a subagent transcript ends with an assistant turn that stopped.
+TASK_ROOT = f"/tmp/claude-{os.getuid()}"
+# "[process exited" covers the detached case, whose exit code is unknown.
+BASH_DONE = ("[exited with code", "[killed]", "[process exited")
+TASK_STALE_SECONDS = 900  # a file untouched this long is over, whatever it says
+TAIL_MAX = 1 << 20  # widen the transcript window no further than this
+
+# The shell hook drops the exit status of a slow command here, keyed by pane.
+# Only the shell knows whether a command succeeded, so this is the one piece
+# that is written per shell; see shell/CONTRACT.md.
+EXIT_DIR = os.path.join(
+    os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "busywatch")
+REPORT_MAX = 4096  # one short line; the rest of a corrupt file is not read
+
+
+def clean(name):
+    """A command name fit to hand herdr: printable, and short enough to draw.
+
+    Names come from other processes' argv and from the hook's file, so they are
+    not ours to trust. An escape sequence or a newline in one would be drawn by
+    the TUI, and there is no length limit on a title or a token value.
+    """
+    return "".join(c for c in name if c.isprintable())[:LABEL_MAX]
+
+
+def open_regular(path):
+    """An fd on a regular file, or None. The caller closes what it gets.
+
+    /tmp and the cache directory are shared, so O_NONBLOCK is what keeps a
+    FIFO planted at one of these paths from blocking the tick forever, and the
+    S_ISREG check is what keeps anything else from being read or unlinked.
+    """
+    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        return None
+    return fd
+
+
+def take_exit_report(pane_id):
+    """(status, command) the shell hook left for this pane, consumed on read.
+
+    The hook only writes for commands past the same threshold busywatch uses,
+    so its presence alone means a slow command just ended — the poller does not
+    need to have sampled it while it ran, which it can miss for a command that
+    finishes moments after crossing the threshold.
+    """
+    # The file is named after the pane, and it is opened and then deleted, so a
+    # pane id has to be one path component before it is joined to anything.
+    if "/" in pane_id or pane_id in (".", ".."):
+        return None
+    path = os.path.join(EXIT_DIR, pane_id)
+    try:
+        fd = open_regular(path)
+        if fd is None:
+            return None
+        try:
+            first = os.read(fd, REPORT_MAX).decode("utf-8", "replace")
+        finally:
+            os.close(fd)
+        os.remove(path)
+        code, _, name = first.split("\n", 1)[0].strip().partition("\t")
+        status = int(code)
+    except (OSError, ValueError):
+        return None
+    # A shell reports 0..255. Wider values still mean failure (pwsh hands back
+    # a 32-bit code), so they are kept rather than dropped, but anything
+    # outside a signed 32-bit range is a corrupt file whose digits would go
+    # into a label unclipped.
+    if not -(2 ** 31) <= status < 2 ** 31:
+        return None
+    return status, (clean(name) or None)
+
+SOCKET_PATH = os.environ.get(
+    "HERDR_SOCKET_PATH", os.path.expanduser("~/.config/herdr/herdr.sock"))
+MAX_RESPONSE = 1 << 20  # a pane list is a few KB; past this the server is faulty
+REQUEST_TIMEOUT = 5  # seconds for a whole request, connect included
+
+
+def api(method, **params):
+    """One request over herdr's socket, returning its result or None.
+
+    The CLI would do the same job, but spawning it costs ~10ms a call against
+    ~0.7ms here, and a tick makes forty of them. Plain requests are one per
+    connection; only event subscriptions keep the socket open.
+    """
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(REQUEST_TIMEOUT)
+            sock.connect(SOCKET_PATH)
+            sock.sendall((json.dumps(
+                {"id": "bw", "method": method, "params": params}) + "\n").encode())
+            # A deadline for the whole reply, not per recv, and a cap on it: a
+            # server that dribbles bytes and never sends a newline would
+            # otherwise hold the tick open and grow the buffer without bound.
+            deadline = time.monotonic() + REQUEST_TIMEOUT
+            buf = b""
+            while not buf.endswith(b"\n") and len(buf) <= MAX_RESPONSE:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                sock.settimeout(remaining)
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+    except OSError:
+        return None
+    try:
+        reply = json.loads(buf.decode())
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    # Valid JSON of the wrong shape is still a faulty peer, not a result.
+    return reply.get("result") if isinstance(reply, dict) else None
+
+
+def list_panes():
+    result = api("pane.list")
+    panes = result.get("panes") if isinstance(result, dict) else None
+    if not isinstance(panes, list):
+        return []
+    return [p for p in panes if isinstance(p, dict) and "pane_id" in p
+            and "workspace_id" in p and "tab_id" in p]
+
+
+def elapsed(seconds):
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m{s % 60:02d}s"
+    return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+
+
+def script_name(argv):
+    """The task a generic interpreter was given, or None if argv names none.
+
+    Skips flags and an `env VAR=VALUE` assignment, steps over a subcommand, and
+    takes the first word of a `-c` body, so `uv run pytest -x` reads as
+    "pytest" and `sh -c 'make -j8 && ./run'` as "make" rather than as the whole
+    script.
+    """
+    body = False
+    for arg in argv[1:]:
+        if arg.startswith("-"):
+            body = arg == "-c"
+            continue
+        # Only a -c body is split into words, because it carries its own flags
+        # and assignments: `sh -c 'FOO=1 make -j8'` is "make". Splitting every
+        # argument would chop a path that has a space in it.
+        words, body = (arg.split() if body else [arg]), False
+        for word in words:
+            if word.startswith("-") or "=" in word or word in SUBCOMMANDS:
+                continue
+            name = os.path.basename(word)
+            if (name and any(c.isalnum() for c in name)
+                    and not any(c in name for c in ";&|<>$`")):
+                return name
+    return None
+
+
+def foreground(pane_id):
+    """The command running in a pane, None at its prompt, UNKNOWN if unreadable."""
+    data = api("pane.process_info", pane_id=pane_id)
+    if not isinstance(data, dict):
+        return UNKNOWN  # no answer, or one we cannot read, is not an idle pane
+    info = data.get("process_info")
+    if not isinstance(info, dict):
+        return None
+    pgid, shell = info.get("foreground_process_group_id"), info.get("shell_pid")
+    if pgid is None or shell is None or pgid == shell:
+        return None
+    procs = info.get("foreground_processes") or []
+    leader = next((p for p in procs if p.get("pid") == pgid), procs[0] if procs else None)
+    if leader is None:
+        return None
+    argv = leader.get("argv") or []
+    # comm is capped at 15 characters, so prefer argv[0].
+    name = os.path.basename(argv[0]) if argv else (leader.get("name") or "")
+    if name in GENERIC:
+        name = script_name(argv) or name
+    name = clean(name)  # before the test: an unprintable argv[0] empties here
+    # The whole group, because the leader may only be waiting on the child that
+    # does the prompting: `./deploy.sh` stopping on "Continue?" blocks in a
+    # child's read while the script itself sits in wait4.
+    pids = [pgid] + [p["pid"] for p in procs if p.get("pid") and p["pid"] != pgid]
+    return {"name": name, "pids": pids} if name else None
+
+
+def waiting_on_input(pid):
+    """Is this process blocked reading the terminal, i.e. waiting for you?
+
+    /proc/<pid>/syscall names the syscall the process is stopped in, with its
+    arguments, so "0 0x0 …" is read(fd 0). Resolving that fd and requiring a
+    terminal keeps reads from files and pipes out, and catches tools that
+    prompt on /dev/tty rather than on stdin. Syscall 0 is read() on x86_64.
+    """
+    try:
+        with open(f"/proc/{pid}/syscall") as fh:
+            fields = fh.read().split()
+        if len(fields) < 2 or fields[0] != "0":
+            return False
+        target = os.readlink(f"/proc/{pid}/fd/{int(fields[1], 16)}")
+    except (OSError, ValueError):
+        return False
+    return target.startswith("/dev/pts/") or target == "/dev/tty"
+
+
+# Tabs have no metadata API, so the only way to mark one is to rename it, and a
+# rename has no TTL to expire. The glyph therefore goes on as a strippable
+# prefix: the real name is always recoverable, and a crashed run is cleaned up
+# by the strip pass on the next start.
+TAB_GLYPHS = {"✗": 3, "⏸": 2, "✓": 1, "▶": 0}  # value is precedence, strongest wins
+
+
+def strip_glyph(label):
+    for glyph in TAB_GLYPHS:
+        if label.startswith(glyph + " "):
+            return label[len(glyph) + 1:]
+    return label
+
+
+def read_tail(path, size=8192):
+    """The last `size` bytes of a file, and whether that reached its start.
+
+    Transcripts get long and only the end matters, but the end has to be read
+    whole: the caller widens the window until it spans a line boundary.
+    """
+    try:
+        fd = open_regular(path)
+        if fd is None:
+            return None, False
+        try:
+            end = os.lseek(fd, 0, os.SEEK_END)
+            start = max(0, end - size)
+            os.lseek(fd, start, os.SEEK_SET)
+            chunks = []
+            want = end - start
+            while want > 0:
+                chunk = os.read(fd, want)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                want -= len(chunk)
+            return b"".join(chunks).decode("utf-8", "replace"), start == 0
+        finally:
+            os.close(fd)
+    except OSError:
+        return None, False
+
+
+def transcript_running(path):
+    """Is this subagent transcript still being written to?
+
+    The last JSONL record decides, so the window has to hold all of it. A
+    single record runs to tens of KB, and a truncated one fails to parse and
+    reads as "still going" — a finished subagent would keep its mark for the
+    whole of TASK_STALE_SECONDS.
+    """
+    size = 8192
+    while True:
+        tail, at_start = read_tail(path, size)
+        if tail is None:
+            return False
+        tail = tail.strip()
+        if "\n" in tail or at_start or size >= TAIL_MAX:
+            break
+        size *= 2
+    try:
+        record = json.loads(tail.rpartition("\n")[2])
+    except json.JSONDecodeError:
+        return True  # caught mid-write, so still going
+    if not isinstance(record, dict):
+        return True  # not a record we understand; TASK_STALE_SECONDS bounds it
+    message = record.get("message")
+    return not (record.get("type") == "assistant"
+                and isinstance(message, dict) and message.get("stop_reason"))
+
+
+def task_running(path):
+    if os.path.basename(path).startswith("a"):
+        return transcript_running(path)
+    tail, _ = read_tail(path)
+    if tail is None:
+        return False
+    # The last line only: a task whose own output mentions one of these — a
+    # grep over a log, or over another task's file — is still running.
+    last = tail.strip().rpartition("\n")[2]
+    return not any(marker in last for marker in BASH_DONE)
+
+
+class Watcher:
+    def __init__(self):
+        self.since = {}  # pane_id -> (label, monotonic time first seen busy)
+        self.shown = {}  # pane_id -> label currently displayed as running
+        self.done = {}  # pane_id -> label that finished while you were elsewhere
+        self.bg_count = {}  # pane_id -> background tasks at the last idle tick
+        self.bg_done = set()  # Claude panes whose work finished while you were away
+        self.bg_marked = set()  # Claude panes currently carrying a bg token
+        self.marked = set()  # workspaces carrying tokens
+        self.labelled = set()  # panes carrying a label
+        self.revisions = {}  # pane_id -> last seen output revision
+        self.sweep = 0  # ticks so far, which places the full poll of every pane
+        self.tabs_marked = set()  # tabs whose name currently carries a glyph
+        self.swept = False  # whether the startup strip pass has run
+        self.verdicts = {}  # task path -> (mtime, size, running), to skip re-reads
+        self.task_dirs = {}  # session id -> its tasks directory, or None
+
+    def mark_tabs(self, wanted, workspaces):
+        """Put the glyph on each wanted tab and take it off every other one."""
+        live = set(workspaces)
+        touched = {t.split(":")[0] for t in set(wanted) | self.tabs_marked}
+        if not self.swept:  # first pass also clears what a crash left behind
+            # |=, not =: shutdown() passes no workspaces, and replacing the
+            # set there would strip nothing at all.
+            touched |= live
+        answered_all = True
+        for workspace in touched:
+            data = api("tab.list", workspace_id=workspace)
+            tabs = data.get("tabs") if isinstance(data, dict) else None
+            if not isinstance(tabs, list):
+                # No answer and an unreadable answer are the same event: the
+                # strip pass is unfinished, and a glyph this workspace holds
+                # has to stay recorded so something comes back to it — the tab
+                # name has no TTL. Unless the workspace is gone, and api()
+                # reports "closed" and "did not answer" alike, so the live set
+                # is the only thing that tells them apart; retrying a closed
+                # one would cost a round-trip every tick forever.
+                answered_all = False
+                if workspace not in live:
+                    self.tabs_marked -= {t for t in self.tabs_marked
+                                         if t.split(":")[0] == workspace}
+                continue
+            # A tab that has been closed appears in no answer, so the
+            # incremental discard below never reaches it: it would sit in
+            # tabs_marked for the life of the poller and keep its workspace in
+            # `touched`, one tab.list round-trip a tick with nothing to do.
+            answered = {tab.get("tab_id") for tab in tabs if isinstance(tab, dict)}
+            self.tabs_marked -= {t for t in self.tabs_marked
+                                 if t.split(":")[0] == workspace
+                                 and t not in answered}
+            for tab in tabs:
+                if not isinstance(tab, dict):
+                    continue
+                # tab_id is not checked: no conforming herdr sends a non-str.
+                tab_id, label = tab.get("tab_id"), tab.get("label", "")
+                if not isinstance(label, str):
+                    continue
+                base = strip_glyph(label)
+                glyph = wanted.get(tab_id)
+                target = f"{glyph} {base}" if glyph else base
+                # Recorded before the rename, whose round-trip is where a
+                # SIGTERM would land. A rename that fails is not retried; the
+                # next start's strip pass takes the glyph off.
+                if glyph:
+                    self.tabs_marked.add(tab_id)
+                else:
+                    self.tabs_marked.discard(tab_id)
+                if target != label:
+                    api("tab.rename", tab_id=tab_id, label=target)
+        # Only once the sweep has actually finished: set before the loop, a
+        # failure part way through would skip the rest of it for good.
+        if answered_all:
+            self.swept = True
+
+    # --- herdr writes ----------------------------------------------------
+    def workspace_tokens(self, workspace, run, wait, finished, failed=False):
+        # A token map is a patch: a string sets a key, None clears it.
+        done = "✗" if failed else "✓"
+        if finished > 1:
+            done = f"{done} {finished}"
+        one = run[0] if len(run) == 1 else None  # one command is worth naming
+        api("workspace.report_metadata", workspace_id=workspace, source=SOURCE,
+            ttl_ms=TOKEN_TTL_MS, tokens={
+                "run": (f"▶ {one}" if one else f"▶ {len(run)}") if run else None,
+                "wait": (f"⏸ {wait}" if wait > 1 else "⏸") if wait else None,
+                "done": done if finished else None,
+            })
+
+    def clear_workspace(self, workspace):
+        api("workspace.report_metadata", workspace_id=workspace, source=SOURCE,
+            tokens=dict.fromkeys(WORKSPACE_TOKENS))
+
+    def label(self, pane_id, text):
+        """Mark the pane itself, so an open workspace shows which pane it is."""
+        if text:
+            api("pane.report_metadata", pane_id=pane_id, source=SOURCE,
+                ttl_ms=TOKEN_TTL_MS, title=text)
+            self.labelled.add(pane_id)
+        elif pane_id in self.labelled:
+            api("pane.report_metadata", pane_id=pane_id, source=SOURCE,
+                clear_title=True)
+            self.labelled.discard(pane_id)
+
+    def background_token(self, pane_id, count, finished):
+        if count or finished:
+            if not count:
+                value = "✓"
+            elif count == 1:
+                value = "⚙"
+            else:
+                value = f"⚙ {count}"
+            api("pane.report_metadata", pane_id=pane_id, source=SOURCE,
+                ttl_ms=TOKEN_TTL_MS, tokens={"bg": value})
+            self.bg_marked.add(pane_id)
+        elif pane_id in self.bg_marked:
+            api("pane.report_metadata", pane_id=pane_id, source=SOURCE,
+                tokens={"bg": None})
+            self.bg_marked.discard(pane_id)
+
+    # --- reading ---------------------------------------------------------
+    def task_dir(self, session_id):
+        """The tasks directory for a session, remembering which project it is in.
+
+        The obvious glob puts a `*` where the project directory goes, which
+        re-lists all of TASK_ROOT once per Claude pane per tick; the README
+        has the numbers. So resolve it once and only look again if it goes
+        away.
+        """
+        if session_id in self.task_dirs:
+            known = self.task_dirs[session_id]
+            # None is memoized too, or a session that has never backgrounded
+            # anything pays the wildcard glob on every tick — the common case,
+            # not a corner. tick() drops those memos on the full sweep, so a
+            # first background task is picked up within one.
+            if known is None or os.path.isdir(known):
+                return known
+        found = glob.glob(f"{TASK_ROOT}/*/{session_id}/tasks")
+        self.task_dirs[session_id] = found[0] if found else None
+        return self.task_dirs[session_id]
+
+    def background_count(self, session_id):
+        """Background tasks this Claude session still has in flight."""
+        running = 0
+        tasks = self.task_dir(session_id)
+        seen = set()
+        for path in glob.glob(f"{tasks}/*.output") if tasks else ():
+            seen.add(path)
+            try:
+                info = os.stat(path)
+            except OSError:
+                continue
+            if time.time() - info.st_mtime > TASK_STALE_SECONDS:
+                continue
+            key = (info.st_mtime, info.st_size)
+            cached = self.verdicts.get(path)
+            verdict = cached[2] if cached and cached[:2] == key else task_running(path)
+            self.verdicts[path] = (*key, verdict)
+            running += verdict
+        # This session's own paths only: the store is shared, so pruning it to
+        # what one session saw makes two idle Claude panes evict each other and
+        # re-read every settled file, transcripts included, every tick. A
+        # session that goes away is NOT swept here, and tick() only drops a
+        # verdict whose directory is gone — Claude's task directories outlive
+        # their sessions by days, so both stores keep an entry per session the
+        # poller ever saw. Slow, small, and known.
+        if tasks:
+            for path in [p for p in self.verdicts
+                         if os.path.dirname(p) == tasks and p not in seen]:
+                del self.verdicts[path]
+        return running
+
+    def worth_polling(self, pane, full):
+        """Skip process_info for panes that cannot have changed since last tick.
+
+        process_info is one request per pane and dominates the cost. A pane
+        already known busy still needs watching, and starting a command always
+        bumps the pane's output revision as the shell echoes it — so anything
+        whose revision is unchanged and that was idle can be left alone. The
+        periodic full sweep bounds how long a missed start could hide.
+        """
+        pane_id, revision = pane["pane_id"], pane.get("revision")
+        changed = self.revisions.get(pane_id) != revision
+        self.revisions[pane_id] = revision
+        return full or changed or pane_id in self.since
+
+    def busy_command(self, pane_id, now):
+        """The command this pane has been running long enough to show, if any."""
+        running = foreground(pane_id)
+        if running is UNKNOWN:
+            return UNKNOWN
+        if running is None or running["name"] in IGNORE:
+            self.since.pop(pane_id, None)
+            return None
+        label, started = self.since.get(pane_id, (None, None))
+        if label != running["name"]:
+            self.since[pane_id] = (running["name"], now)
+            return None
+        if now - started < MIN_BUSY_SECONDS:
+            return None
+        return {**running, "for": now - started}
+
+    # --- per-pane handling ------------------------------------------------
+    def claude_pane(self, pane, pane_id):
+        """A pane herdr already tracks: say whether its background work is alive."""
+        session = pane.get("agent_session")
+        if not isinstance(session, dict):
+            return
+        if session.get("agent") != "claude" or session.get("kind") != "id":
+            return
+        # Only meaningful while the agent looks finished. A foreground command
+        # writes an .output file too, so counting during a turn would restate
+        # the spinner and flicker on every command.
+        if pane.get("agent_status") in ("idle", "done"):
+            count = self.background_count(session["value"])
+            if self.bg_count.get(pane_id, 0) and not count:
+                self.bg_done.add(pane_id)
+            self.bg_count[pane_id] = count
+        else:
+            count = 0
+        # One rule: a pane you are looking at, or one with work still in
+        # flight, has nothing finished to report.
+        if count or pane.get("focused"):
+            self.bg_done.discard(pane_id)
+        finished = pane_id in self.bg_done
+        self.background_token(pane_id, count, finished)
+        return "▶" if count else ("✓" if finished else None)
+
+    def last_verdict(self, pane_id, now):
+        """What this pane reported last tick, for a tick that could not read it.
+
+        herdr failing to answer says nothing about the command, so the previous
+        verdict stands: dropping to "idle" would announce a running command as
+        finished and leave that claim up for as long as it takes to cross
+        MIN_BUSY_SECONDS again. The label is rewritten too, or it would expire
+        on its TTL while the workspace row and the tab still carried the mark.
+        """
+        if pane_id in self.shown:
+            # The verdict too, not just the name: a pane waiting on you must
+            # not replay as running.
+            kind, name = self.shown[pane_id]
+            return self.live_verdict(pane_id, kind, name,
+                                     now - self.since[pane_id][1])
+        return self.finished_verdict(pane_id)
+
+    def live_verdict(self, pane_id, kind, name, seconds):
+        """Label a pane whose command is still going, and report the verdict."""
+        text = f"⏸ {name}" if kind == "wait" else f"▶ {name} {elapsed(seconds)}"
+        self.label(pane_id, text)
+        return kind, name
+
+    def finished_verdict(self, pane_id):
+        """The sticky mark for a pane whose command ended, or (None, None)."""
+        name, code = self.done.get(pane_id, (None, None))
+        if name is None:
+            return None, None
+        self.label(pane_id, f"✗ {name} ({code})" if code else f"✓ {name}")
+        return ("failed" if code else "done"), name
+
+    def shell_pane(self, pane, pane_id, now, full):
+        """A plain pane: returns ("run"|"wait"|None, label) for the workspace roll-up."""
+        if pane.get("focused"):
+            self.done.pop(pane_id, None)
+
+        # A pane already busy is always in self.since, so worth_polling keeps
+        # watching it; anything skipped here was idle and stays idle.
+        command = self.busy_command(pane_id, now) if self.worth_polling(pane, full) else None
+        if command is UNKNOWN:
+            return self.last_verdict(pane_id, now)
+        if command is None:
+            was = self.shown.pop(pane_id, None)
+            report = take_exit_report(pane_id)  # consumed either way
+            if (was or report) and not pane.get("focused"):
+                code, name = report or (None, None)
+                name = name or (was[1] if was else None)
+                if name:  # a mark with nothing to name is not worth showing
+                    self.done[pane_id] = (name, code)
+            kind, name = self.finished_verdict(pane_id)
+            if kind is None:
+                self.label(pane_id, None)
+            return kind, name
+
+        kind = ("wait" if any(waiting_on_input(pid) for pid in command["pids"])
+                else "run")
+        self.shown[pane_id] = (kind, command["name"])
+        self.done.pop(pane_id, None)
+        return self.live_verdict(pane_id, kind, command["name"], command["for"])
+
+    # --- the loop ---------------------------------------------------------
+    def tick(self):
+        now = time.monotonic()
+        full = self.sweep % FULL_SWEEP_TICKS == 0
+        self.sweep += 1
+        if full:
+            # Both task stores are keyed by things that can disappear without
+            # a pane closing, so the pane-keyed sweep in forget() cannot reach
+            # them: re-look for a missing tasks directory, and drop verdicts
+            # whose directory has gone.
+            self.task_dirs = {s: d for s, d in self.task_dirs.items()
+                              if d is not None}
+            self.verdicts = {p: v for p, v in self.verdicts.items()
+                             if os.path.isdir(os.path.dirname(p))}
+        panes = list_panes()
+        if not panes:
+            return
+
+        run, wait, finished = {}, {}, {}
+        failed = set()
+        tabs = {}
+        live = set()
+
+        def mark_tab(tab_id, glyph):
+            current = tabs.get(tab_id)
+            if glyph and (current is None or TAB_GLYPHS[glyph] > TAB_GLYPHS[current]):
+                tabs[tab_id] = glyph
+
+        for pane in panes:
+            pane_id, workspace = pane["pane_id"], pane["workspace_id"]
+            live.add(pane_id)
+            run.setdefault(workspace, [])
+            wait.setdefault(workspace, 0)
+            finished.setdefault(workspace, 0)
+
+            # Panes herdr already tracks stay herdr's; only their blocked state
+            # is rolled up, so a workspace waiting on you says so.
+            if (pane.get("agent") or pane.get("agent_session")
+                    or pane.get("agent_status") != "unknown"):
+                if pane.get("agent_status") == "blocked":
+                    wait[workspace] += 1
+                    mark_tab(pane["tab_id"], "⏸")
+                mark_tab(pane["tab_id"], self.claude_pane(pane, pane_id))
+                continue
+
+            kind, label = self.shell_pane(pane, pane_id, now, full)
+            if kind == "run":
+                run[workspace].append(label)
+                mark_tab(pane["tab_id"], "▶")
+            elif kind == "wait":
+                wait[workspace] += 1
+                mark_tab(pane["tab_id"], "⏸")
+            elif kind == "done":
+                finished[workspace] += 1
+                mark_tab(pane["tab_id"], "✓")
+            elif kind == "failed":
+                finished[workspace] += 1
+                failed.add(workspace)
+                mark_tab(pane["tab_id"], "✗")
+
+        self.forget(live)
+        if full:
+            self.sweep_reports(live)
+        self.mark_tabs(tabs, run)
+        for workspace, running in run.items():
+            if running or wait[workspace] or finished[workspace]:
+                self.workspace_tokens(workspace, running, wait[workspace],
+                                      finished[workspace], workspace in failed)
+                self.marked.add(workspace)
+            elif workspace in self.marked:
+                self.clear_workspace(workspace)
+                self.marked.discard(workspace)
+
+    def sweep_reports(self, live):
+        """Drop hook files left by panes that are gone.
+
+        Nothing else does: the hook is forbidden from cleaning up after itself,
+        and shell_pane only consumes the file of a pane it still sees, so a
+        closed pane's report would sit in the cache directory for good.
+        """
+        try:
+            stale = set(os.listdir(EXIT_DIR)) - live
+        except OSError:
+            return
+        for pane_id in stale:
+            try:
+                os.remove(os.path.join(EXIT_DIR, pane_id))
+            except OSError:
+                pass
+
+    def forget(self, live):
+        for store in (self.since, self.shown, self.done, self.bg_count, self.revisions):
+            for pane_id in set(store) - live:
+                store.pop(pane_id, None)
+        self.bg_done &= live
+        self.bg_marked &= live
+        self.labelled &= live
+
+    def shutdown(self):
+        # Tab names have no TTL, so this is the one mark that must come off.
+        self.mark_tabs({}, [])
+        # The TTL would drop the rest on its own; clearing makes it immediate.
+        for workspace in self.marked:
+            self.clear_workspace(workspace)
+        # Through the same writers the ticks use, so the one path that must
+        # not be wrong is not a second copy of them. list() because both
+        # discard from the set they are iterating.
+        for pane_id in list(self.labelled):
+            self.label(pane_id, None)
+        for pane_id in list(self.bg_marked):
+            self.background_token(pane_id, 0, False)
+        self.marked.clear()
+
+
+def main():
+    watcher = Watcher()
+
+    def stop(_signum, _frame):
+        try:
+            watcher.shutdown()
+        finally:
+            # Exit whatever happens. Without this, a failure in shutdown()
+            # unwinds into the `except Exception` below, which logs it and
+            # loops — so the poller would ignore this and every later SIGTERM,
+            # with `--stop` having already removed the pidfile that finds it.
+            # SystemExit is a BaseException, so that handler cannot catch it.
+            sys.exit(0)
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+
+    while True:
+        try:
+            watcher.tick()
+        except Exception:  # noqa: BLE001
+            # A tick that dies takes the SIGTERM handler with it, and the tab
+            # glyph is the one mark with no TTL to clean it up — so a faulty
+            # reply must cost a tick, not the poller. The log has the detail.
+            traceback.print_exc()
+        time.sleep(POLL_SECONDS)
+
+
+if __name__ == "__main__":
+    main()

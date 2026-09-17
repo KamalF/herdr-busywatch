@@ -43,6 +43,11 @@ def load(name):
 
 bw = load("busywatch")
 bws = load("busywatch-start")
+# Every Watcher() reads the ignore file, so point it away from the developer's
+# own before any test constructs one. Panes gives itself a writable one. The
+# object, not just its name, so the directory goes when the interpreter does.
+IGNORE_DIR = tempfile.TemporaryDirectory()
+bw.IGNORE_FILE = os.path.join(IGNORE_DIR.name, "ignore")
 
 
 class Elapsed(unittest.TestCase):
@@ -106,6 +111,36 @@ class ScriptName(unittest.TestCase):
     def test_no_program_at_all(self):
         self.assertIsNone(bw.script_name(["sh"]))
         self.assertIsNone(bw.script_name(["sh", "-c", "; :"]))
+
+
+class Ignore(unittest.TestCase):
+    """The per-user list edits the defaults; it does not replace them."""
+
+    def test_no_text_leaves_the_defaults(self):
+        self.assertEqual(bw.parse_ignore(""), bw.IGNORE)
+
+    def test_a_bare_name_adds_and_a_dash_removes(self):
+        names = bw.parse_ignore("# servers are noise here\ncaddy  # trailing comment\n"
+                                "\n-ssh\n/usr/bin/tail\n- less\n")
+        self.assertIn("caddy", names)
+        self.assertIn("tail", names, "a path must be reduced to its basename")
+        self.assertNotIn("ssh", names)
+        self.assertNotIn("less", names, "whitespace after the dash is allowed")
+        self.assertIn("vim", names, "the defaults must survive an edit")
+
+    def test_the_defaults_are_never_mutated(self):
+        bw.parse_ignore("-vim\nrogue\n")
+        self.assertIn("vim", bw.IGNORE)
+        self.assertNotIn("rogue", bw.IGNORE)
+
+    def test_a_line_that_is_only_a_comment_or_a_dash_adds_nothing(self):
+        # "foo/" too: its basename is empty, and "" must not join the set.
+        self.assertEqual(bw.parse_ignore("#\n-\n   \nfoo/\n"), bw.IGNORE)
+
+    def test_a_name_is_cleaned_like_the_label_it_must_match(self):
+        # A label is cut at LABEL_MAX, so a longer name could never match.
+        long = "x" * (bw.LABEL_MAX + 5)
+        self.assertIn(bw.clean(long), bw.parse_ignore(long + "\n"))
 
 
 class Foreground(unittest.TestCase):
@@ -326,6 +361,17 @@ class Panes(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.exit_dir, True)
         self.addCleanup(setattr, bw, "EXIT_DIR", bw.EXIT_DIR)
         bw.EXIT_DIR = self.exit_dir
+        # IGNORE_FILE too, and not inside EXIT_DIR, where sweep_reports() would
+        # delete it: the developer's own list must not shape a test.
+        self.config_dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.config_dir, True)
+        self.addCleanup(setattr, bw, "IGNORE_FILE", bw.IGNORE_FILE)
+        bw.IGNORE_FILE = os.path.join(self.config_dir, "ignore")
+        # reload_ignore() logs to stdout, which here is the runner's. A test
+        # that reads the log opens its own redirect inside this one.
+        quiet = contextlib.redirect_stdout(io.StringIO())
+        quiet.__enter__()
+        self.addCleanup(quiet.__exit__, None, None, None)
         self.w = bw.Watcher()
         self.w.swept = True  # skip the startup strip pass
 
@@ -344,6 +390,12 @@ class Panes(unittest.TestCase):
                 "agent_status": "unknown"}
 
     @staticmethod
+    def idle():
+        """A pane at its prompt: the shell is its own foreground group."""
+        return {"process_info": {"foreground_process_group_id": 100,
+                                 "shell_pid": 100, "foreground_processes": []}}
+
+    @staticmethod
     def process_info(argv, pids=(111,)):
         return {"process_info": {
             "foreground_process_group_id": 111, "shell_pid": 100,
@@ -353,6 +405,21 @@ class Panes(unittest.TestCase):
     def titles(self):
         return [p.get("title") for m, p in self.calls
                 if m == "pane.report_metadata" and "title" in p]
+
+    def report(self, line):
+        """What the shell hook leaves for pane w1:p1 when a slow command ends."""
+        with open(os.path.join(self.exit_dir, "w1:p1"), "w") as fh:
+            fh.write(line + "\n")
+
+    def ignore_file(self, text):
+        with open(bw.IGNORE_FILE, "w") as fh:
+            fh.write(text)
+
+    def shown(self, argv, label):
+        """Poll pane w1:p1 once with this command long past the threshold."""
+        self.info = self.process_info(argv)
+        self.w.since["w1:p1"] = (label, -100.0)
+        return self.w.shell_pane(self.pane("r1"), "w1:p1", 0.0, True)
 
     def test_a_dropped_process_info_reply_is_not_a_finished_command(self):
         self.info = self.process_info(["cargo", "build"])
@@ -404,6 +471,173 @@ class Panes(unittest.TestCase):
         self.assertEqual((kind, name), (None, None))
         self.assertNotIn("✗ None (1)", self.titles())
         self.assertEqual(self.w.done, {})
+
+    def test_an_exit_report_for_an_ignored_program_leaves_no_mark(self):
+        # The hook knows nothing of the ignore list, so a long vim session
+        # ends with a report like any slow command's. Left alone, it became a
+        # sticky "✓ vim" on a pane you had just left.
+        self.report("0\tvim")
+        self.info = None
+        self.w.revisions["w1:p1"] = "r1"
+        kind, name = self.w.shell_pane(self.pane("r1"), "w1:p1", 10.0, False)
+        self.assertEqual((kind, name), (None, None))
+        self.assertEqual(self.w.done, {})
+        self.assertFalse(os.path.exists(os.path.join(self.exit_dir, "w1:p1")),
+                         "the report must still be consumed")
+
+    def test_a_report_naming_an_ignored_interpreter_keeps_the_scripts_name(self):
+        # The hook writes the first word, `sh`; the poller showed build.sh.
+        # Filtering the hook's word alone dropped the mark, exit status and
+        # all, where HEAD had at least shown "✗ sh (2)".
+        self.assertEqual(self.shown(["sh", "build.sh"], "build.sh"), ("run", "build.sh"))
+        self.info = self.idle()
+        self.report("2\tsh")
+        self.assertEqual(self.w.shell_pane(self.pane("r2"), "w1:p1", 2.0, True),
+                         ("failed", "build.sh"))
+        self.assertEqual(self.w.done, {"w1:p1": ("build.sh", 2)})
+
+    def test_a_report_that_lands_a_tick_after_the_prompt_still_names_the_script(self):
+        # The hook writes milliseconds after the shell gets the terminal back,
+        # so a poll can see the prompt first. Dropping the remembered name at
+        # that poll left the pane "✓ build.sh" for a command that exited 2.
+        self.shown(["sh", "build.sh"], "build.sh")
+        self.info = self.idle()
+        self.assertEqual(self.w.shell_pane(self.pane("r2"), "w1:p1", 2.0, True),
+                         ("done", "build.sh"))       # no report yet
+        self.report("2\tsh")
+        self.assertEqual(self.w.shell_pane(self.pane("r3"), "w1:p1", 4.0, True),
+                         ("failed", "build.sh"))
+
+    def test_a_command_started_within_the_tick_does_not_name_the_last_ones_mark(self):
+        # build.sh exits 2 and cargo is typed before the next poll: the poll
+        # finds cargo, and the report for build.sh must not become "✗ cargo".
+        self.shown(["sh", "build.sh"], "build.sh")
+        self.info = self.process_info(["cargo", "build"])
+        self.report("2\tsh")
+        self.assertEqual(self.w.shell_pane(self.pane("r2"), "w1:p1", 2.0, True),
+                         ("failed", "build.sh"))
+        self.assertEqual(self.w.seen.get("w1:p1"), "cargo",
+                         "the name of the command running now must be kept")
+
+    def test_a_remembered_name_serves_one_report_only(self):
+        # herdr stays silent for the whole of a second run, `python deploy.py`,
+        # so the poller never sees it. Its report must not be marked with the
+        # name remembered from the first run: "python" is a poor label, but
+        # "build.sh" is a wrong one.
+        self.shown(["sh", "build.sh"], "build.sh")
+        self.info = self.idle()
+        self.report("0\tsh")
+        self.assertEqual(self.w.shell_pane(self.pane("r2"), "w1:p1", 2.0, True),
+                         ("done", "build.sh"))
+        self.w.done.clear()  # the pane was focused in between
+        self.report("2\tpython")
+        self.w.revisions["w1:p1"] = "r3"  # not polled this tick
+        self.assertEqual(self.w.shell_pane(self.pane("r3"), "w1:p1", 60.0, False),
+                         ("failed", "python"))
+
+    def test_an_interpreter_name_is_kept_when_nothing_better_is_known(self):
+        # The poller was down for the whole run: "✗ python (1)" is a poor
+        # label, but no label at all hides a failure.
+        self.report("1\tpython")
+        self.w.revisions["w1:p1"] = "r1"
+        self.assertEqual(self.w.shell_pane(self.pane("r1"), "w1:p1", 10.0, False),
+                         ("failed", "python"))
+
+    def test_an_ignored_script_run_through_an_interpreter_leaves_no_mark(self):
+        # The README tells the user to list the label, "cloudcli", but the
+        # hook reports "node". The poller's name has to decide.
+        self.ignore_file("cloudcli\n")
+        self.w.reload_ignore()
+        self.assertEqual(self.shown(["node", "/opt/bin/cloudcli", "-p", "8888"], "cloudcli"),
+                         (None, None))
+        self.info = self.idle()
+        self.report("0\tnode")
+        self.assertEqual(self.w.shell_pane(self.pane("r2"), "w1:p1", 60.0, True),
+                         (None, None))
+        self.assertEqual(self.w.done, {})
+
+    def test_a_fifo_at_the_ignore_path_neither_blocks_nor_is_read(self):
+        self.ignore_file("caddy\n")
+        self.w.reload_ignore()
+        os.remove(bw.IGNORE_FILE)
+        os.mkfifo(bw.IGNORE_FILE)
+        out = io.StringIO()
+
+        def call():  # a blocking open() on the FIFO would never return
+            with contextlib.redirect_stdout(out):
+                self.w.reload_ignore()
+
+        thread = threading.Thread(target=call, daemon=True)
+        thread.start()
+        thread.join(5)
+        self.assertFalse(thread.is_alive(), "a FIFO at the ignore path blocked the tick")
+        self.assertEqual(self.w.ignore, bw.IGNORE, "a non-file puts the defaults back")
+        self.assertIn("not a regular file", out.getvalue())
+
+    def test_a_directory_at_the_ignore_path_is_named_in_the_log(self):
+        # "mkdir -p it first", misread. A fresh poller found nothing to say
+        # about it, and the README sends the user to the log.
+        os.mkdir(bw.IGNORE_FILE)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            watcher = bw.Watcher()
+        self.assertEqual(watcher.ignore, bw.IGNORE)
+        self.assertIn("not a regular file", out.getvalue())
+
+    def test_an_unreadable_file_keeps_the_defaults_and_says_so(self):
+        self.ignore_file("caddy\n")
+        os.chmod(bw.IGNORE_FILE, 0)
+        if os.access(bw.IGNORE_FILE, os.R_OK):
+            self.skipTest("running as root, where every file is readable")
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.w.reload_ignore()
+        self.assertNotIn("caddy", self.w.ignore)
+        self.assertIn("not read", out.getvalue())
+        self.assertNotIn("after reading", out.getvalue())
+        # The fix the log asks for is a chmod, which changes neither mtime nor
+        # size. It has to be noticed all the same.
+        os.chmod(bw.IGNORE_FILE, 0o644)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.w.reload_ignore()
+        self.assertIn("caddy", self.w.ignore, "a permission fix went unnoticed")
+        self.assertIn("after reading", out.getvalue())
+
+    def test_emptying_or_removing_the_file_is_applied_and_logged(self):
+        self.ignore_file("caddy\n")
+        self.w.reload_ignore()
+        self.assertIn("caddy", self.w.ignore)
+        self.ignore_file("")
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.w.reload_ignore()
+        self.assertNotIn("caddy", self.w.ignore)
+        self.assertIn("after reading", out.getvalue(),
+                      "the README sends the user to the log for every edit")
+        os.remove(bw.IGNORE_FILE)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.w.reload_ignore()
+        self.assertEqual(self.w.ignore, bw.IGNORE)
+        self.assertIn("does not exist", out.getvalue())
+
+    def test_an_unchanged_file_is_not_logged_again(self):
+        self.ignore_file("caddy\n")
+        self.w.reload_ignore()
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.w.reload_ignore()
+        self.assertEqual(out.getvalue(), "", "one line per change, none per sweep")
+
+    def test_an_edit_to_the_ignore_file_is_applied_without_a_restart(self):
+        self.info = self.process_info(["caddy", "run"])
+        self.panes = [self.pane("r1")]
+        self.w.since["w1:p1"] = ("caddy", -100.0)  # long past the threshold
+        self.w.tick()                                 # tick 1: a full sweep
+        self.assertIn("w1:p1", self.w.shown, "caddy is watched by default")
+        self.ignore_file("caddy\n")
+        for _ in range(bw.FULL_SWEEP_TICKS - 1):
+            self.w.tick()                             # not yet a full sweep
+        self.assertIn("w1:p1", self.w.shown, "only a full sweep re-reads the file")
+        self.w.tick()                                 # the next full sweep
+        self.assertIn("caddy", self.w.ignore)
+        self.assertEqual(self.w.shown, {})
+        self.assertEqual(self.w.done, {}, "newly ignored is not finished unseen")
 
     def test_an_unchanged_idle_pane_is_polled_once_per_full_sweep(self):
         self.panes = [self.pane("r1")]

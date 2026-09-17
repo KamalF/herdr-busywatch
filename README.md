@@ -331,22 +331,55 @@ the new `bin/busywatch`.
 
 ## Tuning
 
+### Programs that are not work
+
+Some foreground programs mean "a human is sitting in a TUI", not "work to
+wait on". busywatch ships a list of these: the shells, editors, pagers, file
+managers, system monitors, `mpv`, `claude`, `herdr` and `ssh`. Nothing on it earns a
+mark, so `ssh build-host 'make -j16'` shows nothing. Long-running servers are
+deliberately **not** on it. They count as running, with a growing timer.
+
+Edit the list in `~/.config/busywatch/ignore`. If you set `XDG_CONFIG_HOME`,
+the file is `$XDG_CONFIG_HOME/busywatch/ignore` instead. Nothing creates the
+directory for you, so `mkdir -p` it first. One name per line:
+
+```
+# a server is work, but a timer that grows all day is noise
+caddy
+# watch ssh sessions after all
+-ssh
+```
+
+A bare name is ignored on top of the built-in list. `-name` takes a built-in
+entry off it. `#` starts a comment, and a path is reduced to its last
+component. The poller re-reads the file on its next full sweep, about ten
+seconds, so no restart is needed. Each change to it leaves one line in the log
+named under Running it, and an unchanged file leaves none. That is where to
+look if an edit seems not to apply: no line means the poller saw no change.
+
+Names are compared with the label busywatch would show, after the interpreter
+rule: `node …/bin/cloudcli -p 8888` is labelled `cloudcli`, not `node`, so
+`cloudcli` is the name to list. `sh` counts as an interpreter, so `sh build.sh`
+is labelled `build.sh`. `bash`, `zsh`, `fish` and `dash` do not: `bash build.sh`
+is labelled `bash` and is ignored with it. An ignored program leaves no mark of
+any kind. The report the shell hook writes for it is dropped too, so a long
+`vim` session never ends as `✓ vim`. The hook names the first word of the line,
+though, so a script with a shebang is the one case where the two names differ:
+`./run.sh` runs as `bash`, which is ignored, but ends as `✓ run.sh`. List
+`run.sh` if that mark bothers you.
+
+The built-in list is `IGNORE` at the top of `bin/busywatch`. It is the same
+for every user, so edit the file, not the set.
+
+### Timing
+
 At the top of `bin/busywatch` (see Running it for where that is):
 
-- `IGNORE`: programs that mean "a human is sitting in a TUI" rather than work
-  to wait on. Editors, pagers, file managers, the system monitors and `ssh` are
-  there already, so `ssh build-host 'make -j16'` gets no mark. If you want
-  `ssh` watched, drop it from the set. Long-running servers are deliberately
-  **not** in the set. They count as running, with a growing timer. If that
-  reads as noise, add them.
 - `MIN_BUSY_SECONDS`: how long a command must run before it counts. Keep the
   hook in step: export `BUSYWATCH_MIN_SECONDS` with the same value from your
   shell configuration. All three hooks read it from the environment.
 - `POLL_SECONDS`, `TOKEN_TTL_MS`, `FULL_SWEEP_TICKS`: the trade between cost
   and latency.
-
-An interpreter is a poor label, so `node …/bin/cloudcli -p 8888` reads as
-`cloudcli`, not `node`.
 
 ## Limits
 

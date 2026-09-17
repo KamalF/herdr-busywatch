@@ -36,7 +36,8 @@ WORKSPACE_TOKENS = ("run", "wait", "done")
 UNKNOWN = object()
 
 # Foreground programs that mean "a human is sitting in a TUI", not "work is
-# running". Without this every editor and file manager shows as busy.
+# running". Without this every editor and file manager shows as busy. These
+# are the defaults; IGNORE_FILE adds to them and takes from them, per user.
 IGNORE = {
     "fish", "bash", "zsh", "sh", "dash",
     "hx", "vim", "nvim", "emacs", "nano", "kak",
@@ -45,6 +46,13 @@ IGNORE = {
     "less", "more", "man", "bat", "jless", "visidata",
     "mpv", "claude", "herdr", "ssh",
 }
+
+# One name per line. A bare name is ignored on top of the defaults, `-name`
+# puts a default back under watch, `#` starts a comment. The poller reads it
+# on every full sweep, so an edit needs no restart.
+IGNORE_FILE = os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+    "busywatch", "ignore")
 
 # Interpreters that say nothing about the task, so the script they were given is
 # the better label: `node …/bin/cloudcli -p 8888` reads as "cloudcli".
@@ -79,6 +87,27 @@ def clean(name):
     the TUI, and there is no length limit on a title or a token value.
     """
     return "".join(c for c in name if c.isprintable())[:LABEL_MAX]
+
+
+def parse_ignore(text):
+    """The programs to leave unmarked: the defaults, edited by IGNORE_FILE's text.
+
+    Names are compared with the label a command gets, so each one is put
+    through the same basename and clean() as a label is: a path in the file
+    reduces to its last component, and `python train.py` is matched by
+    "train.py", not "python", because foreground() has already swapped the
+    interpreter for its script.
+    """
+    names = set(IGNORE)
+    for line in text.splitlines():
+        word = line.split("#", 1)[0].strip()
+        remove = word.startswith("-")
+        name = clean(os.path.basename(word[1:].strip() if remove else word))
+        if remove:
+            names.discard(name)
+        elif name:  # "foo/" has no basename, and "" must not join the set
+            names.add(name)
+    return names
 
 
 def open_regular(path):
@@ -363,6 +392,41 @@ class Watcher:
         self.swept = False  # whether the startup strip pass has run
         self.verdicts = {}  # task path -> (mtime, size, running), to skip re-reads
         self.task_dirs = {}  # session id -> its tasks directory, or None
+        self.seen = {}  # pane_id -> name of the last command polled in it
+        self.ignore = set(IGNORE)  # programs that never earn a mark
+        # (problem, text) as IGNORE_FILE was last found. Starts as "missing",
+        # so a poller that starts without one has nothing to say about it.
+        self.ignore_found = ("does not exist", "")
+        self.reload_ignore()
+
+    def reload_ignore(self):
+        """Read IGNORE_FILE, and apply and log it when it is not as last found.
+
+        Whole, on every full sweep: it is a few lines, and reading it is what
+        makes every change count, including a chmod that makes it readable,
+        which no timestamp is sure to show. The log is where "why is my edit
+        not applied" goes, so each change leaves one line there, and one that
+        says whether the file was read, not only that it was found.
+        """
+        try:
+            fd = open_regular(IGNORE_FILE)  # a FIFO would hold the tick open
+            if fd is None:  # a directory is the likely mistake
+                found = ("is not a regular file", "")
+            else:
+                with os.fdopen(fd, encoding="utf-8", errors="replace") as fh:
+                    found = (None, fh.read())
+        except FileNotFoundError:
+            found = ("does not exist", "")
+        except OSError as exc:
+            found = (f"was not read: {exc.strerror}", "")  # exc itself repeats the path
+        if found == self.ignore_found:
+            return
+        self.ignore_found = found
+        problem, text = found
+        self.ignore = parse_ignore(text)
+        print(f"ignore list: {IGNORE_FILE} {problem}, using the defaults" if problem else
+              f"ignore list: {len(self.ignore)} names after reading {IGNORE_FILE}",
+              flush=True)
 
     def mark_tabs(self, wanted, workspaces):
         """Put the glyph on each wanted tab and take it off every other one."""
@@ -537,7 +601,14 @@ class Watcher:
         running = foreground(pane_id)
         if running is UNKNOWN:
             return UNKNOWN
-        if running is None or running["name"] in IGNORE:
+        # Ignored or not, and however briefly: shell_pane needs this name when
+        # the command ends, and the hook's report may not carry it. It is kept
+        # across the prompt, not dropped there, because the report can land a
+        # tick after the poller has already seen the prompt: the hook writes
+        # it milliseconds after the shell gets the terminal back.
+        if running is not None:
+            self.seen[pane_id] = running["name"]
+        if running is None or running["name"] in self.ignore:
             self.since.pop(pane_id, None)
             return None
         label, started = self.since.get(pane_id, (None, None))
@@ -610,6 +681,11 @@ class Watcher:
         if pane.get("focused"):
             self.done.pop(pane_id, None)
 
+        # Before the poll: the name of the command that was in this pane the
+        # last time it was looked at. The poll may find a newer one, started
+        # within the tick, and its name must not go on the mark of the one
+        # that just ended.
+        seen = self.seen.get(pane_id)
         # A pane already busy is always in self.since, so worth_polling keeps
         # watching it; anything skipped here was idle and stays idle.
         command = self.busy_command(pane_id, now) if self.worth_polling(pane, full) else None
@@ -620,9 +696,26 @@ class Watcher:
             report = take_exit_report(pane_id)  # consumed either way
             if (was or report) and not pane.get("focused"):
                 code, name = report or (None, None)
-                name = name or (was[1] if was else None)
-                if name:  # a mark with nothing to name is not worth showing
+                # The hook names the first word of the line and the poller the
+                # script an interpreter was given, so for `sh build.sh` they
+                # disagree: "sh" there, build.sh here. The poller's name is
+                # the one shown while it ran and the one the ignore file is
+                # written against, so it wins whenever the hook's is missing
+                # or an interpreter, and it decides whether there is a mark at
+                # all: the hook does not know the ignore list, so its report
+                # for an ignored program is dropped here. A mark with nothing
+                # to name is not worth showing either.
+                if not name or name in GENERIC:
+                    name = seen or name
+                if name and name not in self.ignore:
                     self.done[pane_id] = (name, code)
+            # A remembered name serves one command. Kept past its report, it
+            # would go on the report of a later command the poller never saw,
+            # which takes herdr being silent for that command's whole life,
+            # but does happen across a herdr restart. Unless the poll just
+            # replaced it with the name of the command running now.
+            if report and self.seen.get(pane_id) == seen:
+                self.seen.pop(pane_id, None)
             kind, name = self.finished_verdict(pane_id)
             if kind is None:
                 self.label(pane_id, None)
@@ -640,6 +733,7 @@ class Watcher:
         full = self.sweep % FULL_SWEEP_TICKS == 0
         self.sweep += 1
         if full:
+            self.reload_ignore()
             # Both task stores are keyed by things that can disappear without
             # a pane closing, so the pane-keyed sweep in forget() cannot reach
             # them: re-look for a missing tasks directory, and drop verdicts
@@ -725,7 +819,8 @@ class Watcher:
                 pass
 
     def forget(self, live):
-        for store in (self.since, self.shown, self.done, self.bg_count, self.revisions):
+        for store in (self.since, self.shown, self.done, self.bg_count,
+                      self.revisions, self.seen):
             for pane_id in set(store) - live:
                 store.pop(pane_id, None)
         self.bg_done &= live

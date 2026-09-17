@@ -148,19 +148,34 @@ trap 'my_own_timer' DEBUG
 source ~/.local/state/busywatch/busywatch.bash
 ```
 
-A neighbour that appends cannot be used at all. bash-preexec, which
-`atuin init bash` installs, appends its own `PROMPT_COMMAND` entry after
-busywatch's. It does this in every version and on every bash. The latch is then
-released too early: the hook can time the wait at the prompt and report a
-prompt-hook command as yours. Source order does not change it:
+A neighbour that appends is bash-preexec, which `atuin init bash` embeds. It
+takes both ends of `PROMPT_COMMAND` for itself, plus the DEBUG trap or, from
+0.6 on bash 5.3, `PS0`. On bash 5.1 and later it turns `PROMPT_COMMAND` into
+an array, so nothing sourced beside it can hold the trailing slot. When
+bash-preexec is already loaded, the hook registers with `preexec_functions`
+and `precmd_functions` instead, and installs no trap and no `PROMPT_COMMAND`
+entry of its own. bash-preexec then does the latch's job and hands the hook
+each command's exit status itself.
+
+bash-preexec must be loaded first, so busywatch stays last:
 
 ```bash
-# broken in both orders
-eval "$(atuin init bash)"
+eval "$(atuin init bash)"      # or: source ~/.bash-preexec.sh
 source ~/.local/state/busywatch/busywatch.bash
 ```
 
-In that case, use the zsh or fish hook, or go without exit codes on bash.
+Sourced before bash-preexec, the hook cannot see it and installs the DEBUG
+trap path, and the fight is back: with bash-preexec 0.6 your commands are
+reported under bash-preexec's own function names, and with 0.5 nothing is
+reported at all. The order above is a requirement, not a preference.
+
+bash-preexec has blind spots of its own, and atuin shares them. It reads the
+command line back from history, so a command that `HISTIGNORE` keeps out of
+history is reported under the previous command's name. Versions before 0.6,
+and any version on bash before 5.3, hook the DEBUG trap and skip it when
+stdout is not a terminal, so there a compound command with a redirection,
+`{ make; } > log`, is not reported at all, and neither is a bare subshell
+line, `(make)`. A plain `make > log` is.
 
 ## How it works
 
@@ -363,9 +378,10 @@ python3 -m unittest discover tests
 
 Stdlib only. The tests cover the pure helpers, drive the `Watcher` against a
 stubbed socket, and write a report from each shell hook. zsh runs through a
-real prompt cycle. bash runs over a pty for the appended-entry case and calls
-the hook directly for the rest. fish runs through its event hook. The poller
-against a real herdr server is not covered.
+real prompt cycle. bash runs over a pty for the appended-entry case and the
+bash-preexec case, which is skipped when bash-preexec is not installed, and
+calls the hook directly for the rest. fish runs through its event hook. The
+poller against a real herdr server is not covered.
 
 ## Prior art
 

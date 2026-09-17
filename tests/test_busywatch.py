@@ -1388,47 +1388,10 @@ class Hooks(unittest.TestCase):
         """The repair of PROMPT_COMMAND lands a cycle late, so the cycle that
         triggers it must not time the appended entry instead of your command.
         """
-        if shutil.which("bash") is None:
-            self.skipTest("bash is not installed")
         hook = os.path.join(ROOT, "shell", "busywatch.bash")
-        rc = os.path.join(self.dir, "bashrc")
-        with open(rc, "w") as fh:
-            fh.write(f"PS1='P> '\n__bw_appended() {{ :; }}\nsource {hook}\n"
-                     'PROMPT_COMMAND="$PROMPT_COMMAND;__bw_appended"\n')
-        main, worker = pty.openpty()
-        proc = subprocess.Popen(["bash", "--rcfile", rc, "-i"], stdin=worker,
-                                stdout=worker, stderr=worker, env=self.env,
-                                start_new_session=True)
-        os.close(worker)
-        self.addCleanup(proc.wait)
-        self.addCleanup(proc.kill)
-        self.addCleanup(os.close, main)
-
-        seen = []
-
-        def settle(seconds):
-            end = time.time() + seconds
-            while time.time() < end:
-                if select.select([main], [], [], 0.1)[0]:
-                    try:
-                        seen.append(os.read(main, 65536).decode(errors="replace"))
-                    except OSError:
-                        return
-
-        def settle_until(seconds, marker):
-            """Drain until the marker reappears, or `seconds` elapse."""
-            end = time.time() + seconds
-            seen.clear()
-            while time.time() < end:
-                if select.select([main], [], [], 0.1)[0]:
-                    try:
-                        seen.append(os.read(main, 65536).decode(errors="replace"))
-                    except OSError:
-                        return
-                    if marker in "".join(seen):
-                        return
-
-        settle(1.0)
+        main, settle_until = self.interactive_bash(
+            f"PS1='P> '\n__bw_appended() {{ :; }}\nsource {hook}\n"
+            'PROMPT_COMMAND="$PROMPT_COMMAND;__bw_appended"\n')
         reports = []
         for _ in range(2):
             os.write(main, b"sleep 2; false\n")
@@ -1444,6 +1407,98 @@ class Hooks(unittest.TestCase):
                          f"an appended PROMPT_COMMAND entry was timed: {reports}")
         self.assertEqual(reports[1], "1\tsleep",
                          f"the cycle after the repair must work: {reports}")
+
+    def interactive_bash(self, rc_text):
+        """An interactive bash on a pty, with `rc_text` as its rc file.
+
+        Returns the pty master and a `settle_until(seconds, marker)` that
+        drains output until `marker` shows up or the time is spent. The DEBUG
+        trap and PROMPT_COMMAND only run for real in interactive mode, so the
+        prompt-cycle regressions cannot be locked any other way.
+        """
+        if shutil.which("bash") is None:
+            self.skipTest("bash is not installed")
+        rc = os.path.join(self.dir, "bashrc")
+        with open(rc, "w") as fh:
+            # HISTFILE= : an `exit` would otherwise append the test's commands
+            # to the developer's real ~/.bash_history.
+            fh.write("HISTFILE=\n" + rc_text)
+        main, worker = pty.openpty()
+        proc = subprocess.Popen(["bash", "--rcfile", rc, "-i"], stdin=worker,
+                                stdout=worker, stderr=worker, env=self.env,
+                                start_new_session=True)
+        os.close(worker)
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        self.addCleanup(os.close, main)
+
+        def settle_until(seconds, marker):
+            end = time.time() + seconds
+            seen = []
+            while time.time() < end:
+                if select.select([main], [], [], 0.1)[0]:
+                    try:
+                        seen.append(os.read(main, 65536).decode(errors="replace"))
+                    except OSError:
+                        break
+                    if marker in "".join(seen):
+                        break
+            return "".join(seen)
+
+        settle_until(2.0, "P> ")      # the first prompt: the rc has run
+        return main, settle_until
+
+    def test_bash_registers_with_bash_preexec(self):
+        """Next to bash-preexec the hook must use its arrays, not fight it.
+
+        bash-preexec (atuin embeds it) takes both ends of PROMPT_COMMAND,
+        which on bash 5.1+ becomes an array the hook's string tests cannot
+        see, and the DEBUG trap or PS0. Fighting it released the latch early
+        and reported a prompt-hook command as yours.
+        """
+        preexec = os.environ.get("BASH_PREEXEC",
+                                 os.path.expanduser("~/.bash-preexec.sh"))
+        if not os.path.exists(preexec):
+            self.skipTest("bash-preexec not found: set BASH_PREEXEC to a copy of"
+                          " https://github.com/rcaloras/bash-preexec")
+        hook = os.path.join(ROOT, "shell", "busywatch.bash")
+        # A stand-in for atuin: a prompt hook that runs commands of its own,
+        # which is exactly what the DEBUG trap would otherwise time.
+        main, settle_until = self.interactive_bash(
+            f"PS1='P> '\nsource {preexec}\n"
+            "__fake_atuin_precmd() { /bin/true; command sleep 0; }\n"
+            "__fake_atuin_preexec() { /bin/true; }\n"
+            "precmd_functions+=(__fake_atuin_precmd)\n"
+            "preexec_functions+=(__fake_atuin_preexec)\n"
+            f"source {hook}\n")
+        path = os.path.join(self.dir, "busywatch", "w1:p1")
+
+        os.write(main, b"sh -c 'sleep 2; exit 7'\n")
+        settle_until(4.0, "P> ")
+        self.assertEqual(self.report, "7\tsh\n")
+        os.remove(path)
+
+        # A group's first word is `{`; the name must be the command inside.
+        os.write(main, b"{ sh -c 'sleep 2; exit 5'; }\n")
+        settle_until(4.0, "P> ")
+        self.assertEqual(self.report, "5\tsh\n")
+        os.remove(path)
+
+        # Sit at the prompt past the threshold, then fail fast: the wait must
+        # not be timed and the prompt hook's commands must not be named.
+        time.sleep(1.5)
+        os.write(main, b"false\n")
+        settle_until(2.0, "P> ")
+        self.assertFalse(os.path.exists(path),
+                         "a fast command was reported after an idle prompt")
+
+        # And the hook installed nothing of its own: the reports above prove
+        # it registered, and how bash-preexec hooks preexec is its own affair.
+        os.write(main, b"declare -p PROMPT_COMMAND; trap -p DEBUG\n")
+        out = settle_until(2.0, "P> ")
+        os.write(main, b"exit\n")
+        self.assertNotIn("__busywatch", out,
+                         f"the hook touched PROMPT_COMMAND or the trap: {out!r}")
 
     def unwritable_cache(self):
         """A cache dir the hook cannot write into, restored on teardown."""

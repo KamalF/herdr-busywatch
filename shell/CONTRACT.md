@@ -94,6 +94,9 @@ rather than a single function, which is what bash's `PROMPT_COMMAND` is:
   file, and any function it calls, traced or not. To chain rather than replace,
   defer the read to the first prompt, where it works: that is what bash-preexec
   does, by appending a string to `PROMPT_COMMAND` that captures the trap and
-  then installs itself. Weigh that against the latch rule above, though:
-  bash-preexec's own entry lands after yours, so keeping a trailing entry last
-  is out of your reach against it whatever you do.
+  then installs itself. Do not share the chain with it, though: its own entry
+  lands after yours, so keeping a trailing entry last is out of your reach
+  against it. Register with its `preexec_functions` and `precmd_functions`
+  instead and install nothing of your own; it passes the command line to the
+  first as `$1` and sets `$?` for the second. `busywatch.bash` does that whenever
+  bash-preexec is already loaded.

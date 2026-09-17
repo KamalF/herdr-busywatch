@@ -4,8 +4,7 @@
 #
 # (Under $XDG_STATE_HOME/busywatch instead if you set that.) See
 # shell/CONTRACT.md for what this writes and why, and the README for what else
-# may own your prompt: a DEBUG trap has one owner, and bash-preexec cannot be
-# made to work with this at all.
+# may own your prompt: a DEBUG trap has one owner.
 #
 # bash has no preexec, so the DEBUG trap stands in for one. It fires for every
 # simple command, including the ones inside PROMPT_COMMAND, so a latch keeps
@@ -14,6 +13,50 @@
 # prompt is drawn. Without the latch a PROMPT_COMMAND entry re-arms the timer,
 # and the next command is reported with that entry's name and the time you
 # spent sitting at the prompt.
+#
+# When bash-preexec is already loaded (`atuin init bash` embeds it), none of
+# that applies: it owns PROMPT_COMMAND and the preexec mechanism, and offers
+# the two hook arrays zsh has. This file then registers with those and installs
+# nothing of its own. bash-preexec must be loaded first; see the README.
+
+__busywatch_report() {
+  # $1 is the exit status of the command that just finished.
+  if [[ -n ${HERDR_PANE_ID-} && -n ${__busywatch_start-} ]]; then
+    local seconds=$(( SECONDS - __busywatch_start ))
+    if (( seconds >= ${BUSYWATCH_MIN_SECONDS:-10} )); then
+      local dir=${XDG_CACHE_HOME:-$HOME/.cache}/busywatch
+      # >| so noclobber cannot refuse the write, and the whole block silenced:
+      # a hook that cannot write must not print. See CONTRACT.md.
+      { mkdir -p "$dir" && printf '%s\t%s\n' "$1" "${__busywatch_cmd##*/}" \
+          >| "$dir/$HERDR_PANE_ID"; } 2>/dev/null
+    fi
+  fi
+  unset __busywatch_start
+}
+
+if [[ -n ${bash_preexec_imported-} || -n ${__bp_imported-} ]]; then
+  __busywatch_bp_preexec() {
+    # bash-preexec calls this once per command line, with the line as $1.
+    __busywatch_start=$SECONDS
+    # Drop what opens a subshell or a group, so `(make; …)` and `{ make; }`
+    # name make rather than nothing or `{`; then cut the first word at
+    # whitespace or an operator, so `false;sleep 2` names false. The escapes
+    # matter: an unescaped `>(` here is a process substitution.
+    local open=${1%%[^[:space:]\(\{]*}
+    local line=${1:${#open}}
+    __busywatch_cmd=${line%%[[:space:]\;\|\&\<\>\(\)]*}
+  }
+  __busywatch_bp_precmd() {
+    # bash-preexec sets $? to the command's status before calling each precmd.
+    __busywatch_report $?
+  }
+  case " ${precmd_functions[@]-} " in     # sourcing ~/.bashrc twice is common
+    *" __busywatch_bp_precmd "*) ;;
+    *) preexec_functions+=(__busywatch_bp_preexec)
+       precmd_functions+=(__busywatch_bp_precmd) ;;
+  esac
+  return 0
+fi
 
 __busywatch_prompt=1   # PROMPT_COMMAND has not finished, so ignore DEBUG
 
@@ -29,17 +72,7 @@ __busywatch_preexec() {
 
 __busywatch_precmd() {
   local code=$?
-  if [[ -n ${HERDR_PANE_ID-} && -n ${__busywatch_start-} ]]; then
-    local seconds=$(( SECONDS - __busywatch_start ))
-    if (( seconds >= ${BUSYWATCH_MIN_SECONDS:-10} )); then
-      local dir=${XDG_CACHE_HOME:-$HOME/.cache}/busywatch
-      # >| so noclobber cannot refuse the write, and the whole block silenced:
-      # a hook that cannot write must not print. See CONTRACT.md.
-      { mkdir -p "$dir" && printf '%s\t%s\n' "$code" "${__busywatch_cmd##*/}" \
-          >| "$dir/$HERDR_PANE_ID"; } 2>/dev/null
-    fi
-  fi
-  unset __busywatch_start
+  __busywatch_report "$code"
   __busywatch_prompt=1
   # Take both positions back, in case something was added since this file was
   # sourced. precmd must run FIRST — the status it captures is the status of

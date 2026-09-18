@@ -784,7 +784,9 @@ class Watcher:
             if glyph and (current is None or TAB_GLYPHS[glyph] > TAB_GLYPHS[current]):
                 tabs[tab_id] = glyph
 
-        for pane in panes:
+        # Sorted by pane: a row per command makes the order visible, and a
+        # name must not change rows because herdr listed the panes differently.
+        for pane in sorted(panes, key=lambda p: p["pane_id"]):
             pane_id, workspace = pane["pane_id"], pane["workspace_id"]
             live.add(pane_id)
             run.setdefault(workspace, [])
@@ -803,7 +805,7 @@ class Watcher:
 
             kind, label = self.shell_pane(pane, pane_id, now, full)
             if kind == "run":
-                run[workspace].append((pane_id, label))
+                run[workspace].append(label)
                 mark_tab(pane["tab_id"], "▶")
             elif kind == "wait":
                 wait[workspace] += 1
@@ -822,11 +824,7 @@ class Watcher:
         self.mark_tabs(tabs, run)
         for workspace, running in run.items():
             if running or wait[workspace] or finished[workspace]:
-                # Sorted by pane, because a row per command makes the order
-                # visible: a name must not change rows from one tick to the
-                # next because herdr listed the panes in another order.
-                names = [name for _, name in sorted(running)]
-                self.workspace_tokens(workspace, names, wait[workspace],
+                self.workspace_tokens(workspace, running, wait[workspace],
                                       finished[workspace], workspace in failed)
                 self.marked.add(workspace)
             elif workspace in self.marked:

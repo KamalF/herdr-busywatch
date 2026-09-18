@@ -119,8 +119,8 @@ qlack
   ▶ npm
 ```
 
-The slots are ordered by pane, so a name keeps its row for as long as its
-command runs. When more than three commands run, the third slot counts the
+The slots are ordered by pane, so a name does not change rows from one tick to
+the next. When more than three commands run, the third slot counts the
 rest: `▶ +4`. The slots stand beside `$run`, which keeps its own shape, so a
 layout can carry either or both.
 

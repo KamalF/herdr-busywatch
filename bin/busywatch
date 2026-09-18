@@ -489,8 +489,13 @@ class Watcher:
     def workspace_tokens(self, workspace, run, wait, finished, failed=False):
         # A token map is a patch: a string sets a key, None clears it.
         done = "✗" if failed else "✓"
-        if finished > 1:
-            done = f"{done} {finished}"
+        # The same rule the run token uses: one pane is worth naming, more than
+        # one is a count. A finished command has no duration on this row, so
+        # the name competes with nothing the row already carries.
+        if len(finished) == 1:
+            done = f"{done} {finished[0]}"
+        elif finished:
+            done = f"{done} {len(finished)}"
         one = run[0] if len(run) == 1 else None  # one command is worth naming
         api("workspace.report_metadata", workspace_id=workspace, source=SOURCE,
             ttl_ms=TOKEN_TTL_MS, tokens={
@@ -761,7 +766,7 @@ class Watcher:
             live.add(pane_id)
             run.setdefault(workspace, [])
             wait.setdefault(workspace, 0)
-            finished.setdefault(workspace, 0)
+            finished.setdefault(workspace, [])
 
             # Panes herdr already tracks stay herdr's; only their blocked state
             # is rolled up, so a workspace waiting on you says so.
@@ -781,10 +786,10 @@ class Watcher:
                 wait[workspace] += 1
                 mark_tab(pane["tab_id"], "⏸")
             elif kind == "done":
-                finished[workspace] += 1
+                finished[workspace].append(label)
                 mark_tab(pane["tab_id"], "✓")
             elif kind == "failed":
-                finished[workspace] += 1
+                finished[workspace].append(label)
                 failed.add(workspace)
                 mark_tab(pane["tab_id"], "✗")
 

@@ -415,6 +415,12 @@ class Panes(unittest.TestCase):
         with open(bw.IGNORE_FILE, "w") as fh:
             fh.write(text)
 
+    def tokens(self):
+        """The last token patch reported for a workspace."""
+        patches = [p["tokens"] for m, p in self.calls
+                   if m == "workspace.report_metadata"]
+        return patches[-1] if patches else None
+
     def shown(self, argv, label):
         """Poll pane w1:p1 once with this command long past the threshold."""
         self.info = self.process_info(argv)
@@ -925,6 +931,28 @@ class Panes(unittest.TestCase):
             self.w.tick()
         self.assertEqual(os.listdir(exit_dir), [],
                          "tick() must run the sweep, not just define it")
+
+    def test_one_finished_pane_names_the_space_mark(self):
+        # The mark is sticky because you were not there to see the command
+        # end. A mark that says only "something failed" drops the one fact
+        # you came back for.
+        self.w.done["w1:p1"] = ("pytest", 1)
+        self.panes = [self.pane("r1")]
+        self.info = self.idle()
+        self.w.tick()
+        self.assertEqual(self.tokens()["done"], "✗ pytest")
+
+    def test_a_finished_pane_that_succeeded_is_named_too(self):
+        self.w.done["w1:p1"] = ("cargo", 0)
+        self.panes = [self.pane("r1")]
+        self.info = self.idle()
+        self.w.tick()
+        self.assertEqual(self.tokens()["done"], "✓ cargo")
+
+    def test_two_finished_panes_keep_the_count(self):
+        # Two names do not fit the row, and neither one is the answer.
+        self.w.workspace_tokens("w1", [], 0, ["pytest", "make"], failed=True)
+        self.assertEqual(self.tokens()["done"], "✗ 2")
 
 
 class Background(unittest.TestCase):

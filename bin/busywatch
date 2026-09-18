@@ -28,7 +28,12 @@ TOKEN_TTL_MS = 8000  # ~4 ticks: marks outlive a slow tick, not a dead poller
 FULL_SWEEP_TICKS = 5  # poll every pane this often, whatever its revision says
 LABEL_MAX = 40  # a name longer than this is noise on every surface
 SOURCE = "busywatch"
-WORKSPACE_TOKENS = ("run", "wait", "done")
+# A token cannot hold a newline: herdr strips it, and "1\n2" is stored as "12".
+# So a Space row per running command needs a token per running command. Three
+# is what a sidebar can spend on one space without pushing the others off.
+RUN_SLOTS = 3
+RUN_TOKENS = tuple(f"run{n}" for n in range(1, RUN_SLOTS + 1))
+WORKSPACE_TOKENS = ("run", "wait", "done") + RUN_TOKENS
 
 # A sentinel distinct from None: "herdr did not answer for this pane" is not
 # the same as "this pane is idle", and treating the first as the second reports
@@ -217,6 +222,23 @@ def elapsed(seconds):
     if s < 3600:
         return f"{s // 60}m{s % 60:02d}s"
     return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+
+
+def run_slots(names):
+    """One token per running command, for a layout with a row per token.
+
+    Past RUN_SLOTS the last slot counts what did not fit, or the named rows
+    would read as the whole story. Every slot is in the answer, empty ones
+    included: a token map is a patch, so a key left out keeps its old value
+    until the TTL takes it.
+    """
+    shown = list(names[:RUN_SLOTS])
+    if len(names) > RUN_SLOTS:
+        shown[-1] = f"+{len(names) - RUN_SLOTS + 1}"
+    slots = dict.fromkeys(RUN_TOKENS)
+    for token, name in zip(RUN_TOKENS, shown):
+        slots[token] = f"▶ {name}"
+    return slots
 
 
 def script_name(argv):
@@ -502,6 +524,7 @@ class Watcher:
                 "run": (f"▶ {one}" if one else f"▶ {len(run)}") if run else None,
                 "wait": (f"⏸ {wait}" if wait > 1 else "⏸") if wait else None,
                 "done": done if finished else None,
+                **run_slots(run),
             })
 
     def clear_workspace(self, workspace):
@@ -780,7 +803,7 @@ class Watcher:
 
             kind, label = self.shell_pane(pane, pane_id, now, full)
             if kind == "run":
-                run[workspace].append(label)
+                run[workspace].append((pane_id, label))
                 mark_tab(pane["tab_id"], "▶")
             elif kind == "wait":
                 wait[workspace] += 1
@@ -799,7 +822,11 @@ class Watcher:
         self.mark_tabs(tabs, run)
         for workspace, running in run.items():
             if running or wait[workspace] or finished[workspace]:
-                self.workspace_tokens(workspace, running, wait[workspace],
+                # Sorted by pane, because a row per command makes the order
+                # visible: a name must not change rows from one tick to the
+                # next because herdr listed the panes in another order.
+                names = [name for _, name in sorted(running)]
+                self.workspace_tokens(workspace, names, wait[workspace],
                                       finished[workspace], workspace in failed)
                 self.marked.add(workspace)
             elif workspace in self.marked:

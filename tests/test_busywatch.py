@@ -60,6 +60,39 @@ class Elapsed(unittest.TestCase):
         self.assertEqual(bw.elapsed(7565), "2h06m")
 
 
+class RunSlots(unittest.TestCase):
+    def test_no_command_leaves_every_slot_empty(self):
+        self.assertEqual(bw.run_slots([]), dict.fromkeys(bw.RUN_TOKENS))
+
+    def test_a_slot_holds_one_name_and_the_rest_stay_empty(self):
+        slots = bw.run_slots(["cargo"])
+        self.assertEqual(slots["run1"], "▶ cargo")
+        self.assertEqual([slots[t] for t in bw.RUN_TOKENS[1:]],
+                         [None] * (bw.RUN_SLOTS - 1))
+
+    def test_a_full_set_of_slots_names_every_command(self):
+        names = [f"c{n}" for n in range(bw.RUN_SLOTS)]
+        self.assertEqual([bw.run_slots(names)[t] for t in bw.RUN_TOKENS],
+                         [f"▶ {n}" for n in names],
+                         "the last slot counted a remainder that is not there")
+
+    def test_the_last_slot_counts_what_did_not_fit(self):
+        names = [f"c{n}" for n in range(bw.RUN_SLOTS + 2)]
+        slots = bw.run_slots(names)
+        self.assertEqual(slots["run1"], "▶ c0")
+        self.assertEqual(slots[bw.RUN_TOKENS[-1]], "▶ +3",
+                         "three commands did not fit, so the slot says +3")
+
+    def test_every_slot_is_in_the_answer(self):
+        # A token map is a patch, so a slot left out of it keeps the name a
+        # busier tick put there until the TTL expires.
+        self.assertEqual(set(bw.run_slots(["cargo"])), set(bw.RUN_TOKENS))
+
+    def test_clear_workspace_knows_the_slots(self):
+        self.assertTrue(set(bw.RUN_TOKENS) <= set(bw.WORKSPACE_TOKENS),
+                        "a slot missing here is never cleared on shutdown")
+
+
 class StripGlyph(unittest.TestCase):
     def test_round_trip(self):
         for glyph in bw.TAB_GLYPHS:
@@ -348,6 +381,7 @@ class Panes(unittest.TestCase):
     def setUp(self):
         self.calls = []
         self.info = None
+        self.infos = {}   # per pane, for a tick that holds two commands
         self.blocked = set()
         self.panes = []
         self.addCleanup(setattr, bw, "api", bw.api)
@@ -378,7 +412,7 @@ class Panes(unittest.TestCase):
     def fake_api(self, method, **params):
         self.calls.append((method, params))
         if method == "pane.process_info":
-            return self.info
+            return self.infos.get(params["pane_id"], self.info)
         if method == "pane.list":
             return {"panes": self.panes}
         return {}
@@ -953,6 +987,38 @@ class Panes(unittest.TestCase):
         # Two names do not fit the row, and neither one is the answer.
         self.w.workspace_tokens("w1", [], 0, ["pytest", "make"], failed=True)
         self.assertEqual(self.tokens()["done"], "✗ 2")
+
+    def running_pair(self, order):
+        """Two panes of one space, each with its own slow command."""
+        self.panes = [dict(self.pane("r1"), pane_id=p) for p in order]
+        self.infos = {"w1:p1": self.process_info(["cargo", "build"]),
+                      "w1:p2": self.process_info(["npm", "run", "dev"])}
+        for pane_id, name in (("w1:p1", "cargo"), ("w1:p2", "npm")):
+            self.w.since[pane_id] = (name, -100.0)
+
+    def test_a_space_running_two_commands_names_both(self):
+        self.running_pair(["w1:p1", "w1:p2"])
+        self.w.tick()
+        slots = self.tokens()
+        self.assertEqual([slots["run1"], slots["run2"]],
+                         ["▶ cargo", "▶ npm"])
+        self.assertEqual(slots["run"], "▶ 2",
+                         "the old token must keep its shape for old layouts")
+
+    def test_the_rows_do_not_follow_the_order_herdr_lists_panes_in(self):
+        # A count never showed the order. A row per command does, and a name
+        # that swaps rows every tick is worse than no name at all.
+        self.running_pair(["w1:p2", "w1:p1"])
+        self.w.tick()
+        slots = self.tokens()
+        self.assertEqual([slots["run1"], slots["run2"]],
+                         ["▶ cargo", "▶ npm"])
+
+    def test_an_emptied_slot_is_cleared_in_the_same_patch(self):
+        self.w.workspace_tokens("w1", ["cargo", "npm"], 0, [])
+        self.w.workspace_tokens("w1", ["cargo"], 0, [])
+        self.assertEqual(self.tokens()["run2"], None,
+                         "run2 kept npm until its TTL ran out")
 
 
 class Background(unittest.TestCase):

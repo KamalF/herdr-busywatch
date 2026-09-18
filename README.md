@@ -9,11 +9,11 @@ deploy, a server. busywatch fills that gap. It registers none of these as an
 agent, so the Agents panel stays a list of real agents.
 
 ```
-spaces                       tabs                    panes of tab 1
-                         ┌──────┬──────┬───┐   ┌─ ▸ cargo 4m12s ─┬─ × pytest (1) ─┐
-  ● api   ▸ cargo ‖ ×    │ × 1  │ ‖ 2  │ 3 │   │ still building  │ failed while   │
-  ● web   ‖              └──────┴──────┴───┘   │                 │ you were away  │
-  ● infra × 2                                  └─────────────────┴────────────────┘
+spaces                              tabs                    panes of tab 1
+                                ┌──────┬──────┬───┐   ┌─ ▸ cargo 4m12s ─┬─ × pytest (1) ─┐
+  ● api   ▸ cargo ‖ × pytest    │ × 1  │ ‖ 2  │ 3 │   │ still building  │ failed while   │
+  ● web   ‖                     └──────┴──────┴───┘   │                 │ you were away  │
+  ● infra × 2                                         └─────────────────┴────────────────┘
 ```
 
 The picture uses look-alike glyphs, because the real marks in the table below
@@ -35,6 +35,10 @@ Marks narrow as you drill in. The Spaces panel says which workspace. The tab
 bar says which tab, without opening anything. The pane label says which pane
 and for how long. `✓` and `✗` are sticky: they stay until you focus that pane.
 That is what makes them useful for something that ended an hour ago.
+
+A mark on the Space row names its command when one pane carries it: `▶ cargo`,
+`✗ pytest`. When two panes of the space carry the same mark, the row has no
+room for both names and gives a count instead: `✗ 2`.
 
 ## Install
 
@@ -87,6 +91,38 @@ so it obeys herdr's own `show_agent_labels_on_pane_borders`, which ships
 `false`. Turn it on to get `▶ cargo 4m12s` on the pane border. herdr draws
 these labels only on the border of a split pane, and only while the pane has no
 manual name of its own.
+
+### A row per running command (optional)
+
+`$run` names the command when one runs in the space, and counts them when more
+do: `▶ 2`. To read every name, add the numbered tokens. There are three of
+them, `$run1` to `$run3`, and each one holds one command. herdr draws a row per
+entry in `rows`, and a row whose tokens are all empty takes no height, so a
+slot costs nothing while it is unused.
+
+```toml
+[ui.sidebar.spaces]
+rows = [
+  ["state_icon", "workspace",
+   { token = "$wait", fg = "#fabd2f", bold = true },
+   { token = "$done", fg = "#83a598", bold = true }],
+  [{ token = "$run1", fg = "#8ec07c" }],
+  [{ token = "$run2", fg = "#8ec07c" }],
+  [{ token = "$run3", fg = "#8ec07c" }],
+  ["branch", "git_status"],
+]
+```
+
+```
+qlack
+  ▶ cargo
+  ▶ npm
+```
+
+The slots are ordered by pane, so a name keeps its row for as long as its
+command runs. When more than three commands run, the third slot counts the
+rest: `▶ +4`. The slots stand beside `$run`, which keeps its own shape, so a
+layout can carry either or both.
 
 ### Exit codes (optional, one line per shell)
 
@@ -391,7 +427,10 @@ At the top of `bin/busywatch` (see Running it for where that is):
   rest is portable.
 - The Space row has no elapsed time. At the default `ui.sidebar_width = 26`
   there is no room for a name *and* a duration. The duration is on the pane
-  label instead.
+  label instead. Every mark on that row carries a name, so a space with one
+  command running and another finished spends its width on two of them. Widen
+  the sidebar, or give a token a row of its own (see *A row per running
+  command*).
 - `✓` counts panes, not commands. Two commands that finish unseen in the same
   pane leave one mark, which names the last.
 - Panes herdr already tracks keep its status. This means any pane with an

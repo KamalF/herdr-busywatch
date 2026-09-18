@@ -38,7 +38,9 @@ That is what makes them useful for something that ended an hour ago.
 
 A mark on the Space row names its command when one pane carries it: `▶ cargo`,
 `✗ pytest`. When two panes of the space carry the same mark, the row has no
-room for both names and gives a count instead: `✗ 2`.
+room for both names and gives a count instead: `✗ 2`. Set `names = off` to keep
+the glyphs and drop every name, and see *How much the row says* for that and
+for how many commands a space lists by name.
 
 ## Install
 
@@ -95,10 +97,10 @@ manual name of its own.
 ### A row per running command (optional)
 
 `$run` names the command when one runs in the space, and counts them when more
-do: `▶ 2`. To read every name, add the numbered tokens. There are three of
-them, `$run1` to `$run3`, and each one holds one command. herdr draws a row per
-entry in `rows`, and a row whose tokens are all empty takes no height, so a
-slot costs nothing while it is unused.
+do: `▶ 2`. To read every name, add the numbered tokens. Each one holds one
+command, and `run_slots` sets how many get filled: three by default, up to
+nine. herdr draws a row per entry in `rows`, and a row whose tokens are all
+empty takes no height, so a slot costs nothing while it is unused.
 
 ```toml
 [ui.sidebar.spaces]
@@ -120,9 +122,15 @@ qlack
 ```
 
 The slots are ordered by pane, so a name does not change rows from one tick to
-the next. When more than three commands run, the third slot counts the
-rest: `▶ +4`. The slots stand beside `$run`, which keeps its own shape, so a
-layout can carry either or both.
+the next. When more commands run than there are slots, the last filled one
+counts the rest: `▶ +4`. The slots stand beside `$run`, which keeps its own
+shape, so a layout can carry either or both.
+
+Put as many `$runN` rows in the layout as `run_slots` fills. Fewer, and the
+count of what did not fit lands in a slot the layout never draws, so a space
+running four commands shows two names and no sign of the other two. To show
+less, lower `run_slots` rather than dropping a row: the `▶ +N` then moves up
+into a slot you can see.
 
 ### Exit codes (optional, one line per shell)
 
@@ -407,6 +415,41 @@ though, so a script with a shebang is the one case where the two names differ:
 The built-in list is `IGNORE` at the top of `bin/busywatch`. It is the same
 for every user, so edit the file, not the set.
 
+### How much the row says
+
+How much a Space mark carries is taste and sidebar width, so it lives in a
+file, not in the code: `~/.config/busywatch/config`, beside the ignore list and
+under `XDG_CONFIG_HOME` on the same terms.
+
+```
+# ~/.config/busywatch/config
+names = on        # on (default) or off
+run_slots = 3     # 1 to 9, how many $runN tokens get filled
+```
+
+One `key = value` per line, `#` starts a comment. It is re-read and logged on
+the same terms as the ignore list above.
+
+`names = off` takes every name off the Space row and leaves the glyphs, so each
+mark has the shape the wait mark already has: the glyph alone for one pane, the
+glyph and a count for more.
+
+| | `names = on` | `names = off` |
+| --- | --- | --- |
+| one running | `▶ cargo` | `▶` |
+| two running | `▶ 2` | `▶ 2` |
+| one finished | `✓ cargo` | `✓` |
+| two finished | `✓ 2` | `✓ 2` |
+
+With names off the numbered slots stay empty, so their rows collapse and the
+switch needs no layout change to go with it. The pane label and the tab bar are
+not touched: the row is the surface short of width, and `▶ cargo 4m12s` on the
+pane is the reason the row can afford to say less.
+
+A line the poller does not understand costs that line and no more: the setting
+keeps its default, and the log names the line, with the character that made it
+unreadable shown as an escape when it is one you cannot see.
+
 ### Timing
 
 At the top of `bin/busywatch` (see Running it for where that is):
@@ -427,10 +470,10 @@ At the top of `bin/busywatch` (see Running it for where that is):
   rest is portable.
 - The Space row has no elapsed time. At the default `ui.sidebar_width = 26`
   there is no room for a name *and* a duration. The duration is on the pane
-  label instead. Every mark on that row carries a name, so a space with one
-  command running and another finished spends its width on two of them. Widen
-  the sidebar, or give a token a row of its own (see *A row per running
-  command*).
+  label instead. With names on, every mark on that row carries one, so a space
+  with one command running and another finished spends its width on two names.
+  Widen the sidebar, give a token a row of its own (see *A row per running
+  command*), or set `names = off`.
 - `✓` counts panes, not commands. Two commands that finish unseen in the same
   pane leave one mark, which names the last.
 - Panes herdr already tracks keep its status. This means any pane with an

@@ -48,6 +48,7 @@ bws = load("busywatch-start")
 # object, not just its name, so the directory goes when the interpreter does.
 IGNORE_DIR = tempfile.TemporaryDirectory()
 bw.IGNORE_FILE = os.path.join(IGNORE_DIR.name, "ignore")
+bw.CONFIG_FILE = os.path.join(IGNORE_DIR.name, "config")
 
 
 class Elapsed(unittest.TestCase):
@@ -61,36 +62,83 @@ class Elapsed(unittest.TestCase):
 
 
 class RunSlots(unittest.TestCase):
+    def filled(self, names, slots=bw.RUN_SLOTS_DEFAULT):
+        """The slots that carry a name, in order, ignoring the empty tail."""
+        answer = bw.run_slots(names, slots)
+        return [answer[t] for t in bw.RUN_TOKENS if answer[t] is not None]
+
     def test_no_command_leaves_every_slot_empty(self):
-        self.assertEqual(bw.run_slots([]), dict.fromkeys(bw.RUN_TOKENS))
+        self.assertEqual(bw.run_slots([], bw.RUN_SLOTS_DEFAULT),
+                         dict.fromkeys(bw.RUN_TOKENS))
 
     def test_a_slot_holds_one_name_and_the_rest_stay_empty(self):
-        slots = bw.run_slots(["cargo"])
+        slots = bw.run_slots(["cargo"], bw.RUN_SLOTS_DEFAULT)
         self.assertEqual(slots["run1"], "▶ cargo")
         self.assertEqual([slots[t] for t in bw.RUN_TOKENS[1:]],
-                         [None] * (bw.RUN_SLOTS - 1))
+                         [None] * (bw.RUN_SLOTS_MAX - 1))
 
     def test_a_full_set_of_slots_names_every_command(self):
-        names = [f"c{n}" for n in range(bw.RUN_SLOTS)]
-        self.assertEqual([bw.run_slots(names)[t] for t in bw.RUN_TOKENS],
-                         [f"▶ {n}" for n in names],
+        names = [f"c{n}" for n in range(bw.RUN_SLOTS_DEFAULT)]
+        self.assertEqual(self.filled(names), [f"▶ {n}" for n in names],
                          "the last slot counted a remainder that is not there")
 
     def test_the_last_slot_counts_what_did_not_fit(self):
-        names = [f"c{n}" for n in range(bw.RUN_SLOTS + 2)]
-        slots = bw.run_slots(names)
-        self.assertEqual(slots["run1"], "▶ c0")
-        self.assertEqual(slots[bw.RUN_TOKENS[-1]], "▶ +3",
+        names = [f"c{n}" for n in range(bw.RUN_SLOTS_DEFAULT + 2)]
+        self.assertEqual(self.filled(names), ["▶ c0", "▶ c1", "▶ +3"],
                          "three commands did not fit, so the slot says +3")
 
-    def test_every_slot_is_in_the_answer(self):
-        # A token map is a patch, so a slot left out of it keeps the name a
-        # busier tick put there until the TTL expires.
-        self.assertEqual(set(bw.run_slots(["cargo"])), set(bw.RUN_TOKENS))
+    def test_a_smaller_setting_fills_fewer_slots(self):
+        self.assertEqual(self.filled(["cargo", "npm"], 1), ["▶ +2"])
+        self.assertEqual(self.filled(["cargo", "npm"], 2), ["▶ cargo", "▶ npm"])
 
-    def test_clear_workspace_knows_the_slots(self):
-        self.assertTrue(set(bw.RUN_TOKENS) <= set(bw.WORKSPACE_TOKENS),
-                        "a slot missing here is never cleared on shutdown")
+    def test_a_larger_setting_fills_more(self):
+        names = [f"c{n}" for n in range(bw.RUN_SLOTS_MAX)]
+        self.assertEqual(self.filled(names, bw.RUN_SLOTS_MAX),
+                         [f"▶ {n}" for n in names])
+
+    def test_every_slot_is_in_the_answer_whatever_the_setting(self):
+        # A token map is a patch, so a slot left out of it keeps the name a
+        # busier tick put there until the TTL expires. This is also what makes
+        # run_slots safe to lower under a running poller: the slots it stops
+        # filling are cleared by the same tick that stops filling them.
+        for slots in (1, bw.RUN_SLOTS_DEFAULT, bw.RUN_SLOTS_MAX):
+            self.assertEqual(set(bw.run_slots(["cargo"], slots)),
+                             set(bw.RUN_TOKENS), f"run_slots = {slots}")
+
+
+class ParseConfig(unittest.TestCase):
+    def test_an_empty_file_is_the_defaults(self):
+        self.assertEqual(bw.parse_config(""),
+                         (bw.NAMES_DEFAULT, bw.RUN_SLOTS_DEFAULT, []))
+
+    def test_both_settings_are_read(self):
+        self.assertEqual(bw.parse_config("names = off\nrun_slots = 5\n"),
+                         (False, 5, []))
+
+    def test_spacing_and_comments_do_not_count(self):
+        text = "# how much the row says\nnames=on   # named\n\n  run_slots =2\n"
+        self.assertEqual(bw.parse_config(text), (True, 2, []))
+
+    def test_a_refused_line_keeps_its_default_and_is_named(self):
+        # Every one of these is a plausible edit, and each must cost its own
+        # line rather than the file: the setting below it still applies.
+        # "²" passes isdigit() and fails int(); five thousand digits pass
+        # isdigit() and trip int()'s own length limit. Neither may raise.
+        for bad in ("names = yes", "names", "run_slots = 0", "run_slots = -1",
+                    "run_slots = many", "colour = red", "run_slots = ²",
+                    f"run_slots = {'1' * 5000}",
+                    f"run_slots = {bw.RUN_SLOTS_MAX + 1}"):
+            names, slots, refused = bw.parse_config(f"{bad}\nrun_slots = 2\n")
+            self.assertEqual(refused, [bad])
+            self.assertEqual((names, slots), (bw.NAMES_DEFAULT, 2), bad)
+
+    def test_the_last_word_on_a_setting_wins(self):
+        self.assertEqual(bw.parse_config("run_slots = 2\nrun_slots = 4\n")[1], 4)
+
+    def test_the_bounds_are_the_slots_that_exist(self):
+        self.assertEqual(bw.parse_config("run_slots = 1")[1], 1)
+        self.assertEqual(bw.parse_config(f"run_slots = {bw.RUN_SLOTS_MAX}")[1],
+                         bw.RUN_SLOTS_MAX)
 
 
 class StripGlyph(unittest.TestCase):
@@ -401,6 +449,8 @@ class Panes(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.config_dir, True)
         self.addCleanup(setattr, bw, "IGNORE_FILE", bw.IGNORE_FILE)
         bw.IGNORE_FILE = os.path.join(self.config_dir, "ignore")
+        self.addCleanup(setattr, bw, "CONFIG_FILE", bw.CONFIG_FILE)
+        bw.CONFIG_FILE = os.path.join(self.config_dir, "config")
         # reload_ignore() logs to stdout, which here is the runner's. A test
         # that reads the log opens its own redirect inside this one.
         quiet = contextlib.redirect_stdout(io.StringIO())
@@ -447,6 +497,10 @@ class Panes(unittest.TestCase):
 
     def ignore_file(self, text):
         with open(bw.IGNORE_FILE, "w") as fh:
+            fh.write(text)
+
+    def config_file(self, text):
+        with open(bw.CONFIG_FILE, "w") as fh:
             fh.write(text)
 
     def tokens(self):
@@ -663,6 +717,53 @@ class Panes(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()) as out:
             self.w.reload_ignore()
         self.assertEqual(out.getvalue(), "", "one line per change, none per sweep")
+
+    def test_a_config_change_says_what_is_now_in_force(self):
+        self.config_file("names = off\nrun_slots = 2\n")
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.w.reload_config()
+        self.assertIn("names off", out.getvalue())
+        self.assertIn("run_slots 2", out.getvalue())
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.w.reload_config()
+        self.assertEqual(out.getvalue(), "", "one line per change, none per sweep")
+
+    def test_a_refused_config_line_is_named_in_the_log(self):
+        # A setting that silently did nothing is the whole reason this file
+        # is logged: the log is where the typo becomes visible.
+        self.config_file("names = yes\n")
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.w.reload_config()
+        self.assertIn("names = yes", out.getvalue())
+        self.assertTrue(self.w.names, "a refused line must keep the default")
+
+    def test_the_log_shows_the_character_that_made_a_line_unreadable(self):
+        # A BOM from a Windows editor, or a zero-width space from a paste, is
+        # the typo you cannot see. Dropping it from the log would print a line
+        # that reads as valid next to a setting that did not apply.
+        self.config_file("﻿names = off\n")
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.w.reload_config()
+        self.assertTrue(self.w.names, "a BOM must not be silently accepted")
+        self.assertIn("\\ufeff", out.getvalue())
+        self.config_file("run_slots = \x1b[31m3\n")
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.w.reload_config()
+        self.assertNotIn("\x1b", out.getvalue(), "an escape reached the log raw")
+        self.assertIn("\\x1b", out.getvalue())
+
+    def test_a_directory_at_the_config_path_keeps_the_defaults(self):
+        # From a non-default state, or the assertion below cannot tell a
+        # reload that restored the defaults from one that changed nothing.
+        self.config_file("names = off\nrun_slots = 1\n")
+        self.w.reload_config()
+        os.remove(bw.CONFIG_FILE)
+        os.mkdir(bw.CONFIG_FILE)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.w.reload_config()
+        self.assertIn("not a regular file", out.getvalue())
+        self.assertEqual((self.w.names, self.w.slots),
+                         (bw.NAMES_DEFAULT, bw.RUN_SLOTS_DEFAULT))
 
     def test_an_edit_to_the_ignore_file_is_applied_without_a_restart(self):
         self.info = self.process_info(["caddy", "run"])
@@ -1013,6 +1114,72 @@ class Panes(unittest.TestCase):
         slots = self.tokens()
         self.assertEqual([slots["run1"], slots["run2"]],
                          ["▶ cargo", "▶ npm"])
+
+    def test_names_off_counts_panes_and_names_none_of_them(self):
+        # The shape the wait mark already has: the glyph alone for one pane,
+        # the glyph and a count for more.
+        self.config_file("names = off\n")
+        self.w.reload_config()
+        self.w.workspace_tokens("w1", ["cargo"], 0, ["pytest"])
+        self.assertEqual((self.tokens()["run"], self.tokens()["done"]),
+                         ("▶", "✓"))
+        self.w.workspace_tokens("w1", ["cargo", "npm"], 0, ["pytest", "make"])
+        self.assertEqual((self.tokens()["run"], self.tokens()["done"]),
+                         ("▶ 2", "✓ 2"))
+
+    def test_names_off_empties_the_slots_without_a_layout_change(self):
+        self.config_file("names = off\n")
+        self.w.reload_config()
+        self.w.workspace_tokens("w1", ["cargo", "npm"], 0, [])
+        self.assertEqual([self.tokens()[t] for t in bw.RUN_TOKENS],
+                         [None] * bw.RUN_SLOTS_MAX)
+
+    def test_turning_names_off_clears_the_names_already_up(self):
+        self.w.workspace_tokens("w1", ["cargo", "npm"], 0, ["pytest"])
+        self.assertEqual(self.tokens()["run1"], "▶ cargo")
+        self.config_file("names = off\n")
+        self.w.reload_config()
+        self.w.workspace_tokens("w1", ["cargo", "npm"], 0, ["pytest"])
+        self.assertEqual(self.tokens()["run1"], None,
+                         "run1 kept cargo until its TTL ran out")
+
+    def test_the_configured_slot_count_is_the_one_used(self):
+        self.config_file("run_slots = 2\n")
+        self.w.reload_config()
+        self.w.workspace_tokens("w1", ["cargo", "npm", "make"], 0, [])
+        self.assertEqual([self.tokens()[t] for t in bw.RUN_TOKENS[:3]],
+                         ["▶ cargo", "▶ +2", None],
+                         "the overflow must land in a slot the setting fills")
+
+    def test_lowering_the_count_clears_the_slots_it_drops(self):
+        self.w.workspace_tokens("w1", ["cargo", "npm", "make"], 0, [])
+        self.assertEqual(self.tokens()["run3"], "▶ make")
+        self.config_file("run_slots = 1\n")
+        self.w.reload_config()
+        self.w.workspace_tokens("w1", ["cargo", "npm", "make"], 0, [])
+        self.assertEqual([self.tokens()[t] for t in bw.RUN_TOKENS[:3]],
+                         ["▶ +3", None, None])
+
+    def test_clear_workspace_reaches_every_slot_the_setting_can_fill(self):
+        # The slots come from RUN_SLOTS_MAX, not from the setting, so that
+        # this holds however high run_slots is set. A future edit that cuts
+        # them from the setting instead is what this test is here to catch.
+        self.config_file(f"run_slots = {bw.RUN_SLOTS_MAX}\n")
+        self.w.reload_config()
+        self.w.workspace_tokens("w1", [f"c{n}" for n in range(bw.RUN_SLOTS_MAX)], 0, [])
+        self.assertEqual(self.tokens()[bw.RUN_TOKENS[-1]], f"▶ c{bw.RUN_SLOTS_MAX - 1}")
+        self.w.clear_workspace("w1")
+        self.assertEqual([self.tokens()[t] for t in bw.RUN_TOKENS],
+                         [None] * bw.RUN_SLOTS_MAX)
+
+    def test_a_tick_applies_the_file_on_a_full_sweep(self):
+        # The path a user actually takes: edit the file, wait, see the change.
+        self.config_file("names = off\n")
+        self.running_pair(["w1:p1", "w1:p2"])
+        self.w.sweep = 0  # a full sweep, which is what re-reads the file
+        self.w.tick()
+        self.assertEqual(self.tokens()["run"], "▶ 2")
+        self.assertEqual(self.tokens()["run1"], None)
 
     def test_an_emptied_slot_is_cleared_in_the_same_patch(self):
         self.w.workspace_tokens("w1", ["cargo", "npm"], 0, [])

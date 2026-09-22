@@ -44,16 +44,40 @@ for how many commands a space lists by name.
 
 ## Install
 
+You need herdr 0.9.0 or later and Python 3.9 or later. Do steps 1 and 2 in
+order. Steps 3 and 4 are optional.
+
+### 1. Install the plugin and start it
+
 ```bash
 herdr plugin install KamalF/herdr-busywatch
+herdr plugin action invoke restart --plugin busywatch
 ```
 
-This covers every mark but `✗`, which needs the shell hook below. `⏸` for
-shell panes also needs `kernel.yama.ptrace_scope=0`. Some distributions ship
-`1`. Make sure of yours with `sysctl kernel.yama.ptrace_scope` (see Limits).
-busywatch requires herdr 0.9.0 or later and Python 3.9 or later.
+The second command matters. The install alone does not start the poller: the
+plugin's `[[startup]]` hook runs only when the herdr server starts. Until the
+poller runs once, nothing is marked and `~/.local/state/busywatch/` does not
+exist. Later server starts run the hook for you, so you do this once.
 
-Add the tokens to your sidebar layout in `~/.config/herdr/config.toml`:
+Check that it worked:
+
+```bash
+ls ~/.local/state/busywatch/
+# busywatch  busywatch.bash  busywatch.fish  busywatch.log  busywatch.pid
+# busywatch.service  busywatch.zsh
+```
+
+If you set `XDG_STATE_HOME`, the directory is `$XDG_STATE_HOME/busywatch`.
+Substitute it in every path in this README.
+
+From here on, the tab bar already carries marks. The Spaces panel needs step 2.
+
+### 2. Add the marks to the sidebar
+
+Put this in `~/.config/herdr/config.toml`. A fresh herdr install has no such
+file, so create it. If the file already has a `[ui.sidebar.spaces]` or
+`[ui.sidebar.agents]` table, edit that table instead of adding a second one:
+TOML rejects a table that is defined twice.
 
 ```toml
 [ui.sidebar.spaces]
@@ -73,32 +97,27 @@ rows = [
 ]
 ```
 
-herdr does not watch `config.toml`. Apply an edit with:
+herdr does not watch `config.toml`. Apply the edit:
 
 ```bash
 herdr server reload-config
 ```
 
-When the layout is accepted, the command answers `"status": "applied"` with an
-empty `diagnostics` list. This doubles as the syntax check.
+The command answers `"status": "applied"` with an empty `diagnostics` list
+when the layout is accepted. This doubles as the syntax check.
 
-Then start the poller once. The plugin's `[[startup]]` hook runs only when the
-herdr server starts, so a fresh install shows nothing until then. Restart the
-server, or run the **Restart busywatch** action from the workspace menu.
-`bin/busywatch-start` does the same by hand. Each of these also links the shell
-hooks into place for the section below.
+That completes the install. Every mark but `✗` now shows. `⏸` for shell panes
+also needs `kernel.yama.ptrace_scope=0`, and some distributions ship `1`. Make
+sure of yours with `sysctl kernel.yama.ptrace_scope` (see Limits).
 
-The tab glyph needs no configuration. The pane label is a reported pane title,
-so it obeys herdr's own `show_agent_labels_on_pane_borders`, which ships
-`false`. Turn it on to get `▶ cargo 4m12s` on the pane border. herdr draws
-these labels only on the border of a split pane, and only while the pane has no
-manual name of its own.
+#### Alternative layout: a row per running command
 
-### A row per running command (optional)
+This replaces the `[ui.sidebar.spaces]` table above. It is not a second step.
+Skip it unless you want a name for every running command.
 
 `$run` names the command when one runs in the space, and counts them when more
-do: `▶ 2`. To read every name, add the numbered tokens. Each one holds one
-command, and `run_slots` sets how many get filled: three by default, up to
+do: `▶ 2`. To read every name, use the numbered tokens instead. Each one holds
+one command, and `run_slots` sets how many get filled: three by default, up to
 nine. herdr draws a row per entry in `rows`, and a row whose tokens are all
 empty takes no height, so a slot costs nothing while it is unused.
 
@@ -132,24 +151,44 @@ running four commands shows two names and no sign of the other two. To show
 less, lower `run_slots` rather than dropping a row: the `▶ +N` then moves up
 into a slot you can see.
 
-### Exit codes (optional, one line per shell)
+### 3. Optional: labels on pane borders
 
-The hooks are linked under `~/.local/state/busywatch`, so there is no plugin
-root to look up. If you set `XDG_STATE_HOME`, the directory is
-`$XDG_STATE_HOME/busywatch` instead. Substitute it in every path below.
+The pane label is a reported pane title, so it obeys herdr's own
+`show_agent_labels_on_pane_borders`, which ships `false`. To get
+`▶ cargo 4m12s` on the pane border, add it to the `[ui]` table of the same
+`config.toml` and run `herdr server reload-config` again:
+
+```toml
+[ui]
+show_agent_labels_on_pane_borders = true
+```
+
+herdr draws these labels only on the border of a split pane, and only while the
+pane has no manual name of its own.
+
+### 4. Optional: exit codes, for the `✗` mark
+
+Without a shell hook, a failed command shows as `✓`. Add one line for your
+shell. The file it names exists only after step 1, so do step 1 first.
 
 ```bash
 # fish
 ln -s ~/.local/state/busywatch/busywatch.fish ~/.config/fish/conf.d/
-# zsh, in ~/.zshrc
+# zsh, at the end of ~/.zshrc
 source ~/.local/state/busywatch/busywatch.zsh
-# bash, in ~/.bashrc, last
+# bash, as the last line of ~/.bashrc (see "On bash" below for why)
 source ~/.local/state/busywatch/busywatch.bash
 ```
 
-The links are refreshed every time the plugin's start script runs, so they
-follow an upgrade that moves the plugin. zsh and fish have real hook lists and
-need no ordering. bash is the exception, below.
+The hook takes effect in shells you open afterwards. To check it, run
+`sleep 12; false` in a new pane and switch to another tab at once. When the
+command ends, that pane's tab reads `✗`. The mark shows only on a pane you are
+not looking at, so it does not appear if you stay on the pane.
+
+The paths are links into the plugin, so there is no plugin root to look up.
+The start script refreshes them every time it runs, so they follow an upgrade
+that moves the plugin. zsh and fish have real hook lists and need no ordering.
+bash is the exception, below.
 
 The hook is the only shell-specific piece, and it is the only route to an exit
 status. The poller sees a command start and stop, not whether it worked.
@@ -472,8 +511,8 @@ At the top of `bin/busywatch` (see Running it for where that is):
   there is no room for a name *and* a duration. The duration is on the pane
   label instead. With names on, every mark on that row carries one, so a space
   with one command running and another finished spends its width on two names.
-  Widen the sidebar, give a token a row of its own (see *A row per running
-  command*), or set `names = off`.
+  Widen the sidebar, give a token a row of its own (see *Alternative layout: a
+  row per running command*), or set `names = off`.
 - `✓` counts panes, not commands. Two commands that finish unseen in the same
   pane leave one mark, which names the last.
 - Panes herdr already tracks keep its status. This means any pane with an

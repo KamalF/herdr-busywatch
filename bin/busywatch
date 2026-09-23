@@ -446,6 +446,56 @@ def transcript_running(path):
                 and isinstance(message, dict) and message.get("stop_reason"))
 
 
+def descendants(pid):
+    """pid and every process below it, or None where /proc cannot say.
+
+    The children files need CONFIG_PROC_CHILDREN, which the major distributions
+    enable. Without it, or without /proc, the caller falls back on reading the
+    task files. A child that exits mid-walk is skipped, not an error.
+    """
+    if not os.path.exists(f"/proc/{pid}/task/{pid}/children"):
+        return None
+    found, todo = [], [pid]
+    while todo:
+        current = todo.pop()
+        try:
+            tids = os.listdir(f"/proc/{current}/task")
+        except OSError:
+            continue
+        found.append(current)
+        for tid in tids:
+            try:
+                with open(f"/proc/{current}/task/{tid}/children") as fh:
+                    todo.extend(int(child) for child in fh.read().split())
+            except (OSError, ValueError):
+                continue
+    return found
+
+
+def open_tasks(pid):
+    """The task files the processes under pid hold open, or None if unknown.
+
+    Claude points a background command's stdout and stderr at its .output file,
+    and every process in the task inherits them, so the file is held open for
+    exactly as long as something of the task still runs. That is true however
+    quiet the task is, and whatever session the pane reports now: Claude keeps
+    writing under the session it started with, also after a /clear.
+    """
+    procs = descendants(pid)
+    if procs is None:
+        return None
+    held = set()
+    for proc in procs:
+        for fd in (1, 2):
+            try:
+                target = os.readlink(f"/proc/{proc}/fd/{fd}")
+            except OSError:
+                continue
+            if target.startswith(TASK_ROOT + "/") and target.endswith(".output"):
+                held.add(target)
+    return held
+
+
 def task_running(path):
     if os.path.basename(path).startswith("a"):
         return transcript_running(path)
@@ -474,6 +524,7 @@ class Watcher:
         self.swept = False  # whether the startup strip pass has run
         self.verdicts = {}  # task path -> (mtime, size, running), to skip re-reads
         self.task_dirs = {}  # session id -> its tasks directory, or None
+        self.claude_pids = {}  # pane_id -> pid of the Claude process in it
         self.seen = {}  # pane_id -> name of the last command polled in it
         self.ignore = set(IGNORE)  # programs that never earn a mark
         # (problem, text) as IGNORE_FILE was last found. Starts as "missing",
@@ -667,12 +718,46 @@ class Watcher:
         self.task_dirs[session_id] = found[0] if found else None
         return self.task_dirs[session_id]
 
-    def background_count(self, session_id):
-        """Background tasks this Claude session still has in flight."""
-        running = 0
+    def claude_pid(self, pane_id):
+        """The process a Claude pane runs, remembered for as long as it lives."""
+        if not os.path.isdir("/proc"):
+            return None  # open_tasks needs it, so the request would be wasted
+        pid = self.claude_pids.get(pane_id)
+        if pid is None or not os.path.isdir(f"/proc/{pid}"):
+            running = foreground(pane_id)
+            pid = running["pids"][0] if isinstance(running, dict) else None
+            self.claude_pids[pane_id] = pid
+        return pid
+
+    def background_count(self, session_id, pid=None):
+        """Background tasks this Claude session still has in flight.
+
+        With the Claude process known, a Bash task runs while a process holds
+        its file open; see open_tasks. Only subagents, which run inside Claude
+        and hold nothing open, are read from their transcripts. Without it,
+        every task is read from its file, which misses a quiet task past
+        TASK_STALE_SECONDS and a session that changed id.
+        """
+        held = open_tasks(pid) if pid else None
+        running = len(held or ())
         tasks = self.task_dir(session_id)
+        if tasks:
+            running += self.transcripts_running(tasks, held)
+        for other in {os.path.dirname(p) for p in held or ()} - {tasks}:
+            running += self.transcripts_running(other, held)
+        return running
+
+    def transcripts_running(self, tasks, held):
+        """Tasks in this directory that their own files say are running.
+
+        Every task when held is None, only the subagents when it is not: a Bash
+        task in held is already counted, and one outside it has ended.
+        """
+        running = 0
         seen = set()
-        for path in glob.glob(f"{tasks}/*.output") if tasks else ():
+        for path in glob.glob(f"{tasks}/*.output"):
+            if held is not None and not os.path.basename(path).startswith("a"):
+                continue
             seen.add(path)
             try:
                 info = os.stat(path)
@@ -685,17 +770,16 @@ class Watcher:
             verdict = cached[2] if cached and cached[:2] == key else task_running(path)
             self.verdicts[path] = (*key, verdict)
             running += verdict
-        # This session's own paths only: the store is shared, so pruning it to
-        # what one session saw makes two idle Claude panes evict each other and
-        # re-read every settled file, transcripts included, every tick. A
+        # This directory's own paths only: the store is shared, so pruning it
+        # to what one session saw makes two idle Claude panes evict each other
+        # and re-read every settled file, transcripts included, every tick. A
         # session that goes away is NOT swept here, and tick() only drops a
         # verdict whose directory is gone — Claude's task directories outlive
         # their sessions by days, so both stores keep an entry per session the
         # poller ever saw. Slow, small, and known.
-        if tasks:
-            for path in [p for p in self.verdicts
-                         if os.path.dirname(p) == tasks and p not in seen]:
-                del self.verdicts[path]
+        for path in [p for p in self.verdicts
+                     if os.path.dirname(p) == tasks and p not in seen]:
+            del self.verdicts[path]
         return running
 
     def worth_polling(self, pane, full):
@@ -747,7 +831,7 @@ class Watcher:
         # writes an .output file too, so counting during a turn would restate
         # the spinner and flicker on every command.
         if pane.get("agent_status") in ("idle", "done"):
-            count = self.background_count(session["value"])
+            count = self.background_count(session["value"], self.claude_pid(pane_id))
             if self.bg_count.get(pane_id, 0) and not count:
                 self.bg_done.add(pane_id)
             self.bg_count[pane_id] = count
@@ -939,7 +1023,7 @@ class Watcher:
 
     def forget(self, live):
         for store in (self.since, self.shown, self.done, self.bg_count,
-                      self.revisions, self.seen):
+                      self.revisions, self.seen, self.claude_pids):
             for pane_id in set(store) - live:
                 store.pop(pane_id, None)
         self.bg_done &= live

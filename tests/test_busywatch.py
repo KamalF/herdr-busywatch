@@ -1311,6 +1311,78 @@ class Background(unittest.TestCase):
                          "a new task did not clear the finished mark")
 
 
+@unittest.skipUnless(os.path.exists(f"/proc/{os.getpid()}/task/{os.getpid()}/children"),
+                     "needs /proc with CONFIG_PROC_CHILDREN")
+class HeldTasks(unittest.TestCase):
+    """Bash tasks read from the processes that hold their files open.
+
+    The test process stands in for Claude: a child it starts with stdout on a
+    task file is what Claude's background command looks like from /proc.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.addCleanup(setattr, bw, "TASK_ROOT", bw.TASK_ROOT)
+        bw.TASK_ROOT = self.dir
+        self.w = bw.Watcher()
+
+    def tasks(self, session):
+        path = os.path.join(self.dir, "project", session, "tasks")
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def hold(self, path):
+        """Start a quiet task writing to path, as Claude would."""
+        with open(path, "w") as out:
+            child = subprocess.Popen(["sleep", "30"], stdout=out, stderr=out)
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        return child
+
+    def test_a_file_is_held_while_its_task_runs(self):
+        path = os.path.join(self.tasks("sess"), "b1.output")
+        child = self.hold(path)
+        self.assertEqual(bw.open_tasks(os.getpid()), {path})
+        child.kill()
+        child.wait()
+        self.assertEqual(bw.open_tasks(os.getpid()), set())
+
+    def test_a_quiet_task_past_the_stale_limit_still_counts(self):
+        # A port-forward or a watcher prints nothing for hours. The file's
+        # mtime says nothing about whether it still runs.
+        path = os.path.join(self.tasks("sess"), "b1.output")
+        self.hold(path)
+        old = time.time() - bw.TASK_STALE_SECONDS - 60
+        os.utime(path, (old, old))
+        self.assertEqual(self.w.background_count("sess", os.getpid()), 1)
+
+    def test_a_task_under_the_session_claude_started_with_counts(self):
+        # After a /clear herdr reports the new session id, but Claude keeps
+        # writing its tasks under the one it started with.
+        self.tasks("now")
+        self.hold(os.path.join(self.tasks("before"), "b1.output"))
+        self.assertEqual(self.w.background_count("now", os.getpid()), 1)
+
+    def test_a_task_nothing_holds_has_ended_whatever_it_says(self):
+        # Killed with no marker written, or ended between the marker writes.
+        with open(os.path.join(self.tasks("sess"), "b1.output"), "w") as fh:
+            fh.write("building...\n")
+        self.assertEqual(self.w.background_count("sess", os.getpid()), 0)
+
+    def test_the_pane_process_comes_from_herdr(self):
+        self.addCleanup(setattr, bw, "api", bw.api)
+        bw.api = lambda method, **kw: ({"process_info": {
+            "foreground_process_group_id": os.getpid(), "shell_pid": 1,
+            "foreground_processes": [{"pid": os.getpid(), "argv": ["claude"]}]}}
+            if method == "pane.process_info" else {})
+        self.hold(os.path.join(self.tasks("before"), "b1.output"))
+        pane = {"agent_session": {"agent": "claude", "kind": "id", "value": "now"},
+                "agent_status": "idle", "focused": False}
+        self.assertEqual(self.w.claude_pane(pane, "w1:p1"), "▶")
+        self.assertEqual(self.w.bg_count["w1:p1"], 1)
+
+
 class Replies(unittest.TestCase):
     """A faulty peer on the socket must cost a tick, not the poller."""
 

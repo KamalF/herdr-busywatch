@@ -317,17 +317,28 @@ Syscall `0` is `read()` on x86_64. On another architecture, adjust
 ### Claude background work
 
 Claude Code writes one `.output` file per background task under
-`/tmp/claude-$UID/<project>/<session>/tasks/`. A pane's `agent_session.value`
-is that session id, so no hook is needed to find them:
+`/tmp/claude-$UID/<project>/<session>/tasks/`. No hook is needed to find them:
 
-- `b…`: a backgrounded `Bash` command. It is done when its **last line** carries
-  `[exited with code N]`, `[killed]`, or `[process exited while detached…]`.
-  The last line, not the whole file, so a task whose own output mentions one of
-  these does not read as finished.
-- `a…`: a background subagent, a JSONL transcript. It is done when the last
-  record is an `assistant` turn that carries a `stop_reason`.
+- `b…`: a backgrounded `Bash` command. Claude points the command's stdout and
+  stderr at the file, and every process of the task inherits them. So the task
+  runs for exactly as long as some process below the pane's Claude process
+  holds the file open, and the poller reads that from `/proc/<pid>/fd`. This
+  holds however quiet the task is, and whatever session the pane reports. The
+  second case matters: after a `/clear`, herdr reports the new session id, but
+  Claude keeps writing under the one it started with.
+- `a…`: a background subagent, a JSONL transcript. It runs inside Claude and
+  holds nothing open, so its file decides. It is done when the last record is
+  an `assistant` turn that carries a `stop_reason`. It is found through the
+  pane's `agent_session.value`, and through the directory of any `b…` file
+  held open.
 
-A file untouched for 15 minutes counts as finished, whatever it says. Verdicts
+Without `/proc`, or without `CONFIG_PROC_CHILDREN` for the process tree, a
+`b…` file decides too. It is done when its **last line** carries
+`[exited with code N]`, `[killed]`, or `[process exited while detached…]`.
+The last line, not the whole file, so a task whose own output mentions one of
+these does not read as finished. Only the pane's own session is searched then.
+
+A file read this way that is untouched for 15 minutes counts as finished, whatever it says. Verdicts
 are cached on `(mtime, size)`, so a settled file is read once. The count shows
 only while the agent is `idle` or `done`. A foreground command writes an
 `.output` file too, so a count during a turn only restates the spinner. A `✓`

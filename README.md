@@ -260,6 +260,26 @@ stdout is not a terminal, so there a compound command with a redirection,
 `{ make; } > log`, is not reported at all, and neither is a bare subshell
 line, `(make)`. A plain `make > log` is.
 
+## Update
+
+herdr has no update command. Install again, then restart the poller:
+
+```bash
+herdr plugin install KamalF/herdr-busywatch
+herdr plugin action invoke restart --plugin busywatch
+```
+
+The install replaces the plugin's checkout. It keeps your settings in
+`~/.config/busywatch/`, your sidebar layout and your shell hook. Do the
+restart too: the poller that runs keeps the old code until the next herdr
+server start. The restart also refreshes the links that the shell hook uses.
+If you run the poller under systemd instead, run
+`systemctl --user restart busywatch`, and see Running it for when the unit
+needs an edit.
+
+To see the version you have, run `herdr plugin list`. It shows the commit
+that you installed.
+
 ## How it works
 
 One poller, every 2 seconds, over herdr's unix socket:

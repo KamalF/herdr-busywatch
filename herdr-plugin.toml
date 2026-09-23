@@ -1,6 +1,6 @@
 id = "busywatch"
 name = "busywatch"
-version = "0.1.0"
+version = "0.2.0"
 min_herdr_version = "0.9.0"
 description = "Mark workspaces, tabs and panes that are running, waiting on you, or finished unseen"
 platforms = ["linux", "macos"]
